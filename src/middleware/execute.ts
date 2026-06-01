@@ -17,10 +17,12 @@
  * Read-only tools (retrieve, list) bypass this middleware entirely.
  */
 
+import { randomUUID } from "node:crypto";
+import type Stripe from "stripe";
 import { config } from "../config.js";
 import { writeAuditEntry } from "../audit/log.js";
 import { scoreRisk } from "../risk/engine.js";
-import { createApproval } from "../approval/store.js";
+import { getApproval, createApproval, consumeApproval } from "../approval/store.js";
 import { toErrorResponse } from "../utils/errors.js";
 import type { McpToolResponse, OperationContext, RiskScore } from "../types.js";
 
@@ -39,12 +41,11 @@ import type { McpToolResponse, OperationContext, RiskScore } from "../types.js";
  * @typeParam T - The Stripe response type (e.g. `Stripe.Refund`).
  * @param context - Describes what is about to happen (tool, customer, amount, etc.).
  * @param operation - A zero-arg async function that performs the actual Stripe SDK call.
- * @returns A {@link McpToolResponse} — success with data, or failure with structured error.
- * @throws Never — all errors are caught and returned as structured responses.
+ * @returns A standardized `McpToolResponse` with either `success: true` or `success: false`.
  */
 export async function executeStripeOperation<T>(
   context: OperationContext,
-  operation: () => Promise<T>,
+  operation: (options: Stripe.RequestOptions) => Promise<T>,
 ): Promise<McpToolResponse<T>> {
   // ── 1. Sanity check ─────────────────────────────────────────────
   if (context.capability.readOnly) {
@@ -68,41 +69,80 @@ export async function executeStripeOperation<T>(
     };
   }
 
+  // ── Idempotency Generation ──────────────────────────────────────
+  const idempotencyKey = context.params.idempotency_key ?? randomUUID();
+
+  // ── Approval Token Consumption ──────────────────────────────────
+  let riskResult: RiskScore | null = null;
+  let isPreApproved = false;
+
+  if (context.params.approval_token) {
+    const approval = getApproval(context.params.approval_token);
+    
+    if (!approval || approval.status !== "approved") {
+      return {
+        success: false,
+        error: {
+          code: "invalid_approval",
+          type: "policy_error",
+          message: "Approval token is invalid, expired, or not yet approved.",
+        },
+      };
+    }
+
+    // Token is valid. Mark as consumed to prevent replay attacks.
+    if (!consumeApproval(approval.token)) {
+      return {
+        success: false,
+        error: {
+          code: "token_already_consumed",
+          type: "policy_error",
+          message: "This approval token has already been consumed.",
+        },
+      };
+    }
+
+    isPreApproved = true;
+  }
+
   // ── 3. Dry-run mode ─────────────────────────────────────────────
   if (config.dryRun) {
-    // Score risk even in dry-run so the caller sees what would happen
-    let riskResult: RiskScore | null = null;
-    if (context.capability.riskScored) {
+    // If risk scored, compute it for the audit log
+    if (context.capability.riskScored && !isPreApproved) {
       riskResult = await scoreRisk(context);
     }
 
-    writeAuditEntry(context, "dry_run", riskResult?.total ?? null, {
-      params: context.params,
-      ...(riskResult !== null ? { risk: riskResult } : {}),
-    });
+    const metadata: Record<string, unknown> = { dry_run: true, idempotency_key: idempotencyKey };
+    if (isPreApproved) {
+      metadata.pre_approved_by_token = context.params.approval_token;
+    }
+    writeAuditEntry(
+      context,
+      "dry_run",
+      riskResult ? riskResult.total : null,
+      metadata,
+    );
 
     return {
       success: true,
       data: {
         dry_run: true,
-        tool: context.capability.tool,
+        simulated_success: true,
         operation: context.capability.operation,
+        risk_score: riskResult?.total,
+        idempotency_key: idempotencyKey,
         params: context.params,
-        risk_score: riskResult,
-      } as T,
+      } as unknown as T,
     };
   }
 
   // ── 4. Risk scoring ─────────────────────────────────────────────
-  let riskResult: RiskScore | null = null;
-
-  if (context.capability.riskScored) {
+  if (context.capability.riskScored && !isPreApproved) {
     riskResult = await scoreRisk(context);
 
     if (riskResult.outcome === "block") {
       writeAuditEntry(context, "blocked", riskResult.total, {
-        risk_factors: riskResult.factors,
-        risk_reasons: riskResult.reasons,
+        reasons: riskResult.reasons,
       });
 
       return {
@@ -121,6 +161,7 @@ export async function executeStripeOperation<T>(
   // ── 5. Approval gate ────────────────────────────────────────────
   if (
     context.capability.approvalEligible &&
+    !isPreApproved &&
     shouldRequireApproval(context)
   ) {
     const approval = createApproval(context, riskResult?.total ?? 0);
@@ -146,16 +187,23 @@ export async function executeStripeOperation<T>(
 
   // ── 6. Execute ──────────────────────────────────────────────────
   try {
-    const result = await operation();
+    const result = await operation({ idempotencyKey });
 
-    const metadata: Record<string, unknown> = {};
-    if (riskResult !== null && riskResult.outcome === "flag") {
+    const metadata: Record<string, unknown> = { idempotency_key: idempotencyKey };
+    if (isPreApproved) {
+      metadata.pre_approved_by_token = context.params.approval_token;
+    }
+    if (riskResult) {
       metadata.risk_score = riskResult.total;
-      metadata.risk_factors = riskResult.factors;
       metadata.risk_reasons = riskResult.reasons;
     }
 
-    writeAuditEntry(context, "success", riskResult?.total ?? null, metadata);
+    writeAuditEntry(
+      context,
+      "success",
+      riskResult ? riskResult.total : null,
+      metadata,
+    );
 
     return { success: true, data: result };
 

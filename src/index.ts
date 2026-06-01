@@ -25,7 +25,7 @@ import "./stripe-client.js";
 
 // ── Infrastructure ──────────────────────────────────────────────────
 import { config } from "./config.js";
-import { getDb, closeAllDatabases } from "./utils/db.js";
+import { getAuditDb, getApprovalsDb, closeAllDatabases } from "./utils/db.js";
 import { startApprovalServer } from "./approval/server.js";
 
 // ── Tool handlers ───────────────────────────────────────────────────
@@ -177,8 +177,8 @@ async function main(): Promise<void> {
 
   // ── Open databases ────────────────────────────────────────────────
   // This explicitly initializes the SQLite databases on startup as requested
-  getDb("audit");
-  getDb("approvals");
+  getAuditDb();
+  getApprovalsDb();
 
   // ── Start approval HTTP server ──────────────────────────────────
   startApprovalServer();
@@ -191,49 +191,49 @@ async function main(): Promise<void> {
     "create_customer",
     "Create a new Stripe customer with optional email, name, phone, description, and metadata.",
     CreateCustomerSchema.shape,
-    async (args) => formatResponse(await createCustomer(args)),
+    async (args: any) => formatResponse(await createCustomer(args)),
   );
 
   server.tool(
     "retrieve_customer",
     "Retrieve a Stripe customer by their unique ID (cus_xxx).",
     RetrieveCustomerSchema.shape,
-    async (args) => formatResponse(await retrieveCustomer(args)),
+    async (args: any) => formatResponse(await retrieveCustomer(args)),
   );
 
   server.tool(
     "update_customer",
     "Update an existing customer's email, name, phone, description, or metadata.",
     UpdateCustomerSchema.shape,
-    async (args) => formatResponse(await updateCustomer(args)),
+    async (args: any) => formatResponse(await updateCustomer(args)),
   );
 
   server.tool(
     "delete_customer",
     "Permanently delete a customer. Requires force: true. Routes through risk engine and approval. Consider archive_customer instead.",
     DeleteCustomerSchema.shape,
-    async (args) => formatResponse(await deleteCustomer(args)),
+    async (args: any) => formatResponse(await deleteCustomer(args)),
   );
 
   server.tool(
     "list_customers",
     "List customers with optional email filter and cursor-based pagination.",
     ListCustomersSchema.shape,
-    async (args) => formatResponse(await listCustomers(args)),
+    async (args: any) => formatResponse(await listCustomers(args)),
   );
 
   server.tool(
     "archive_customer",
     "Soft-delete a customer by setting archived metadata. The customer remains in Stripe but is flagged for future purge.",
     ArchiveCustomerSchema.shape,
-    async (args) => formatResponse(await archiveCustomer(args)),
+    async (args: any) => formatResponse(await archiveCustomer(args)),
   );
 
   server.tool(
     "purge_expired_customers",
     "Find and permanently delete customers whose archive period has expired. Use dry_run: true to preview.",
     PurgeExpiredCustomersSchema.shape,
-    async (args) => formatResponse(await purgeExpiredCustomers(args)),
+    async (args: any) => formatResponse(await purgeExpiredCustomers(args)),
   );
 
   // ────────────────────────────────────────────────────────────────
@@ -244,35 +244,35 @@ async function main(): Promise<void> {
     "create_payment_intent",
     "Create a payment intent for a specified amount and currency. Optionally associate with a customer.",
     CreatePaymentIntentSchema.shape,
-    async (args) => formatResponse(await createPaymentIntent(args)),
+    async (args: any) => formatResponse(await createPaymentIntent(args)),
   );
 
   server.tool(
     "retrieve_payment_intent",
     "Retrieve a payment intent by its unique ID (pi_xxx).",
     RetrievePaymentIntentSchema.shape,
-    async (args) => formatResponse(await retrievePaymentIntent(args)),
+    async (args: any) => formatResponse(await retrievePaymentIntent(args)),
   );
 
   server.tool(
     "confirm_payment_intent",
     "Confirm a payment intent to initiate payment collection. Optionally attach a payment method.",
     ConfirmPaymentIntentSchema.shape,
-    async (args) => formatResponse(await confirmPaymentIntent(args)),
+    async (args: any) => formatResponse(await confirmPaymentIntent(args)),
   );
 
   server.tool(
     "cancel_payment_intent",
     "Cancel a payment intent that has not yet been captured. Accepts an optional cancellation reason.",
     CancelPaymentIntentSchema.shape,
-    async (args) => formatResponse(await cancelPaymentIntent(args)),
+    async (args: any) => formatResponse(await cancelPaymentIntent(args)),
   );
 
   server.tool(
     "list_payment_intents",
     "List payment intents with optional customer filter and cursor-based pagination.",
     ListPaymentIntentsSchema.shape,
-    async (args) => formatResponse(await listPaymentIntents(args)),
+    async (args: any) => formatResponse(await listPaymentIntents(args)),
   );
 
   // ────────────────────────────────────────────────────────────────
@@ -283,7 +283,7 @@ async function main(): Promise<void> {
     "create_subscription",
     "Create a subscription for a customer with one or more price line items.",
     CreateSubscriptionSchema.shape,
-    async (args) => formatResponse(await createSubscription(args)),
+    async (args: any) => formatResponse(await createSubscription(args)),
   );
 
   server.tool(

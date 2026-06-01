@@ -60,17 +60,17 @@ export async function createSubscription(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () =>
+    (options) =>
       stripe.subscriptions.create({
         customer: input.customer,
-        items: input.items.map((item) => ({
+        items: input.items?.map((item: any) => ({
           price: item.price,
           quantity: item.quantity,
         })),
         payment_behavior: input.payment_behavior,
         collection_method: input.collection_method,
         metadata: input.metadata,
-      }),
+      }, options),
   );
 }
 
@@ -142,7 +142,7 @@ export async function updateSubscription(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () => {
+    (options) => {
       const { subscription_id, ...params } = input;
 
       const updateParams: Stripe.SubscriptionUpdateParams = {
@@ -161,7 +161,7 @@ export async function updateSubscription(
         }));
       }
 
-      return stripe.subscriptions.update(subscription_id, updateParams);
+      return stripe.subscriptions.update(subscription_id, updateParams, options);
     },
   );
 }
@@ -212,7 +212,7 @@ export async function cancelSubscription(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    async () => {
+    async (options) => {
       // ── End-of-period cancellation ─────────────────────────────
       // Uses update (not cancel) because Stripe's cancel endpoint
       // always terminates immediately. Setting cancel_at_period_end
@@ -220,7 +220,7 @@ export async function cancelSubscription(
       if (input.cancel_at_period_end === true) {
         return stripe.subscriptions.update(input.subscription_id, {
           cancel_at_period_end: true,
-        });
+        }, options);
       }
 
       // ── Immediate cancellation ─────────────────────────────────
@@ -233,7 +233,7 @@ export async function cancelSubscription(
         cancelParams.prorate = input.prorate;
       }
 
-      return stripe.subscriptions.cancel(input.subscription_id, cancelParams);
+      return stripe.subscriptions.cancel(input.subscription_id, cancelParams, options);
     },
   );
 }

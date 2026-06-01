@@ -82,14 +82,14 @@ export async function createRefund(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () =>
+    (options) =>
       stripe.refunds.create({
         payment_intent: input.payment_intent,
         charge: input.charge,
         amount: input.amount,
         reason: input.reason,
         metadata: input.metadata,
-      }),
+      }, options),
   );
 }
 

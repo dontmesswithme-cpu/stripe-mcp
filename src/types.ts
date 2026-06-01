@@ -93,7 +93,10 @@ export interface OperationContext {
   /** ISO 4217 currency code, if applicable. */
   readonly currency?: string;
   /** Serializable snapshot of the input params (for audit + approval storage). */
-  readonly params: Record<string, unknown>;
+  readonly params: Record<string, unknown> & {
+    readonly approval_token?: string;
+    readonly idempotency_key?: string;
+  };
 }
 
 /** Outcome tiers from the risk engine. */
@@ -197,6 +200,18 @@ export interface PurgeResult {
 // § Shared Sub-schemas (DRY building blocks)
 // ═════════════════════════════════════════════════════════════════════
 
+export const BaseMutationSchema = z.object({
+  approval_token: z
+    .string()
+    .uuid()
+    .optional()
+    .describe("Provide the UUID token here if executing a pre-approved operation."),
+  idempotency_key: z
+    .string()
+    .optional()
+    .describe("UUID to prevent duplicate execution on retries. Strongly recommended."),
+});
+
 /**
  * Stripe key/value metadata.
  * Up to 50 keys, each key ≤40 chars, each value ≤500 chars.
@@ -257,7 +272,7 @@ export const CreateCustomerSchema = z.object({
     .optional()
     .describe("Customer's phone number in E.164 format (e.g. +14155551234)."),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type CreateCustomerInput = z.infer<typeof CreateCustomerSchema>;
 
 export const ListCustomersSchema = PaginationSchema.extend({
@@ -300,7 +315,7 @@ export const UpdateCustomerSchema = z.object({
     .optional()
     .describe("Updated phone number in E.164 format."),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type UpdateCustomerInput = z.infer<typeof UpdateCustomerSchema>;
 
 export const DeleteCustomerSchema = z.object({
@@ -314,7 +329,7 @@ export const DeleteCustomerSchema = z.object({
       "Must be true to confirm permanent deletion. This action is " +
         "irreversible. Consider using archive_customer instead.",
     ),
-});
+}).merge(BaseMutationSchema);
 export type DeleteCustomerInput = z.infer<typeof DeleteCustomerSchema>;
 
 // ═════════════════════════════════════════════════════════════════════
@@ -352,7 +367,7 @@ export const CreatePaymentIntentSchema = z.object({
         "Omit to use Stripe's automatic payment methods.",
     ),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type CreatePaymentIntentInput = z.infer<typeof CreatePaymentIntentSchema>;
 
 export const ListPaymentIntentsSchema = PaginationSchema.extend({
@@ -382,7 +397,7 @@ export const ConfirmPaymentIntentSchema = z.object({
     .startsWith("pm_")
     .optional()
     .describe("Payment method ID to attach and confirm with."),
-});
+}).merge(BaseMutationSchema);
 export type ConfirmPaymentIntentInput = z.infer<typeof ConfirmPaymentIntentSchema>;
 
 export const CancelPaymentIntentSchema = z.object({
@@ -394,7 +409,7 @@ export const CancelPaymentIntentSchema = z.object({
     .enum(["duplicate", "fraudulent", "requested_by_customer", "abandoned"])
     .optional()
     .describe("Reason for cancellation — shown in the Stripe dashboard."),
-});
+}).merge(BaseMutationSchema);
 export type CancelPaymentIntentInput = z.infer<typeof CancelPaymentIntentSchema>;
 
 // ═════════════════════════════════════════════════════════════════════
@@ -434,7 +449,7 @@ export const CreateInvoiceSchema = z.object({
         "collection_method is 'send_invoice'.",
     ),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type CreateInvoiceInput = z.infer<typeof CreateInvoiceSchema>;
 
 export const ListInvoicesSchema = PaginationSchema.extend({
@@ -470,7 +485,7 @@ export const FinalizeInvoiceSchema = z.object({
       "Whether to auto-collect after finalizing. Defaults to the " +
         "invoice's existing auto_advance setting.",
     ),
-});
+}).merge(BaseMutationSchema);
 export type FinalizeInvoiceInput = z.infer<typeof FinalizeInvoiceSchema>;
 
 export const VoidInvoiceSchema = z.object({
@@ -478,7 +493,7 @@ export const VoidInvoiceSchema = z.object({
     .string()
     .startsWith("in_")
     .describe("The invoice ID to void. Invoice must be 'open'."),
-});
+}).merge(BaseMutationSchema);
 export type VoidInvoiceInput = z.infer<typeof VoidInvoiceSchema>;
 
 export const PayInvoiceSchema = z.object({
@@ -508,7 +523,7 @@ export const PayInvoiceSchema = z.object({
       "Set to true when the customer is not present during payment " +
         "(e.g. automated collection or retry).",
     ),
-});
+}).merge(BaseMutationSchema);
 export type PayInvoiceInput = z.infer<typeof PayInvoiceSchema>;
 
 // ═════════════════════════════════════════════════════════════════════
@@ -555,7 +570,7 @@ export const CreateSubscriptionSchema = z.object({
     .optional()
     .describe("How payment is collected. Defaults to 'charge_automatically'."),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type CreateSubscriptionInput = z.infer<typeof CreateSubscriptionSchema>;
 
 export const ListSubscriptionsSchema = PaginationSchema.extend({
@@ -628,7 +643,7 @@ export const UpdateSubscriptionSchema = z.object({
     .optional()
     .describe("How to handle proration when changing items mid-cycle."),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type UpdateSubscriptionInput = z.infer<typeof UpdateSubscriptionSchema>;
 
 export const CancelSubscriptionSchema = z.object({
@@ -658,7 +673,7 @@ export const CancelSubscriptionSchema = z.object({
       "If true, a prorated credit is generated for unused time " +
         "in the current period. Only applies to immediate cancellation.",
     ),
-});
+}).merge(BaseMutationSchema);
 export type CancelSubscriptionInput = z.infer<typeof CancelSubscriptionSchema>;
 
 // ═════════════════════════════════════════════════════════════════════
@@ -713,7 +728,7 @@ export const CreateProductSchema = z.object({
     .optional()
     .describe("Inline default price to create alongside the product."),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type CreateProductInput = z.infer<typeof CreateProductSchema>;
 
 export const ListProductsSchema = PaginationSchema.extend({
@@ -751,7 +766,7 @@ export const UpdateProductSchema = z.object({
     .optional()
     .describe("Set to false to archive the product."),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type UpdateProductInput = z.infer<typeof UpdateProductSchema>;
 
 // ═════════════════════════════════════════════════════════════════════
@@ -795,7 +810,7 @@ export const CreatePriceSchema = z.object({
     .optional()
     .describe("Brief internal label for this price (not shown to customers)."),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 export type CreatePriceInput = z.infer<typeof CreatePriceSchema>;
 
 export const ListPricesSchema = PaginationSchema.extend({
@@ -858,7 +873,7 @@ export const CreateRefundFields = z.object({
     .optional()
     .describe("Reason for the refund — shown in the Stripe dashboard."),
   metadata: MetadataSchema,
-});
+}).merge(BaseMutationSchema);
 
 /**
  * Full CreateRefund schema with cross-field validation.
@@ -953,7 +968,7 @@ export const ArchiveCustomerSchema = z.object({
     .string()
     .startsWith("cus_")
     .describe("The customer ID to archive (soft delete)."),
-});
+}).merge(BaseMutationSchema);
 export type ArchiveCustomerInput = z.infer<typeof ArchiveCustomerSchema>;
 
 export const PurgeExpiredCustomersSchema = z.object({
@@ -963,7 +978,7 @@ export const PurgeExpiredCustomersSchema = z.object({
     .describe(
       "If true, list customers that would be purged without deleting them.",
     ),
-});
+}).merge(BaseMutationSchema);
 export type PurgeExpiredCustomersInput = z.infer<
   typeof PurgeExpiredCustomersSchema
 >;

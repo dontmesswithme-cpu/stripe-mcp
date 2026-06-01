@@ -62,14 +62,14 @@ export async function createCustomer(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () =>
+    (options) =>
       stripe.customers.create({
         email: input.email,
         name: input.name,
         description: input.description,
         phone: input.phone,
         metadata: input.metadata,
-      }),
+      }, options),
   );
 }
 
@@ -153,7 +153,7 @@ export async function updateCustomer(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () => {
+    (options) => {
       const { customer_id, ...params } = input;
 
       return stripe.customers.update(customer_id, {
@@ -162,7 +162,7 @@ export async function updateCustomer(
         description: params.description,
         phone: params.phone,
         metadata: params.metadata,
-      });
+      }, options);
     },
   );
 }
@@ -214,7 +214,7 @@ export async function deleteCustomer(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () => stripe.customers.del(input.customer_id),
+    (options) => stripe.customers.del(input.customer_id, options),
   );
 }
 
@@ -254,7 +254,7 @@ export async function archiveCustomer(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () => {
+    (options) => {
       const deleteAfter = new Date(
         Date.now() + config.archiveDeleteAfterDays * 24 * 60 * 60 * 1000,
       ).toISOString();
@@ -265,7 +265,7 @@ export async function archiveCustomer(
           archived_at: new Date().toISOString(),
           delete_after: deleteAfter,
         },
-      });
+      }, options);
     },
   );
 }
@@ -306,11 +306,11 @@ export async function purgeExpiredCustomers(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    async () => {
+    async (options) => {
       const searchResult = await stripe.customers.search({
         query: 'metadata["archived"]:"true"',
         limit: 100,
-      });
+      }, options);
 
       const now = new Date();
       const expired = searchResult.data.filter((c) => {
@@ -330,7 +330,7 @@ export async function purgeExpiredCustomers(
       const deleted: string[] = [];
       for (const customer of expired) {
         try {
-          await stripe.customers.del(customer.id);
+          await stripe.customers.del(customer.id, options);
           deleted.push(customer.id);
         } catch {
           /* skip failed deletes */

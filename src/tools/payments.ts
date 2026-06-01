@@ -62,7 +62,7 @@ export async function createPaymentIntent(
       currency: input.currency,
       params: input as Record<string, unknown>,
     },
-    () =>
+    (options) =>
       stripe.paymentIntents.create({
         amount: input.amount,
         currency: input.currency,
@@ -70,7 +70,7 @@ export async function createPaymentIntent(
         description: input.description,
         payment_method_types: input.payment_method_types,
         metadata: input.metadata,
-      }),
+      }, options),
   );
 }
 
@@ -145,7 +145,7 @@ export async function confirmPaymentIntent(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () => {
+    (options) => {
       const confirmParams: Stripe.PaymentIntentConfirmParams = {};
 
       if (input.payment_method !== undefined) {
@@ -155,6 +155,7 @@ export async function confirmPaymentIntent(
       return stripe.paymentIntents.confirm(
         input.payment_intent_id,
         confirmParams,
+        options
       );
     },
   );
@@ -199,7 +200,7 @@ export async function cancelPaymentIntent(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () => {
+    (options) => {
       const cancelParams: Stripe.PaymentIntentCancelParams = {};
 
       if (input.cancellation_reason !== undefined) {
@@ -209,6 +210,7 @@ export async function cancelPaymentIntent(
       return stripe.paymentIntents.cancel(
         input.payment_intent_id,
         cancelParams,
+        options
       );
     },
   );

@@ -43,6 +43,7 @@ export interface StripeMcpConfig {
   readonly dataDir: string;
 
   // ── Approval server
+  readonly approvalApiKey: string;
   readonly approvalPort: number;
   readonly approvalExpiryMinutes: number;
   readonly approvalRefundThreshold: number;
@@ -73,6 +74,7 @@ export const config: StripeMcpConfig = Object.freeze({
   dataDir: envStr("STRIPE_MCP_DATA_DIR", "./data"),
 
   // Approval server
+  approvalApiKey: envStr("APPROVAL_API_KEY", "dev_key_change_in_production"),
   approvalPort: envInt("APPROVAL_PORT", 3001),
   approvalExpiryMinutes: envInt("APPROVAL_EXPIRY_MINUTES", 60),
   approvalRefundThreshold: envInt("APPROVAL_REFUND_THRESHOLD", 100_000),

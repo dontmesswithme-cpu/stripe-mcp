@@ -132,7 +132,7 @@ export async function payInvoice(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () => {
+    (options) => {
       const payParams: Stripe.InvoicePayParams = {};
 
       if (input.payment_method !== undefined) {
@@ -145,7 +145,7 @@ export async function payInvoice(
         payParams.off_session = input.off_session;
       }
 
-      return stripe.invoices.pay(input.invoice_id, payParams);
+      return stripe.invoices.pay(input.invoice_id, payParams, options);
     },
   );
 }

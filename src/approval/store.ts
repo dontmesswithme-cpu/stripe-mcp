@@ -165,6 +165,19 @@ function expirePending(): void {
   ).run(new Date().toISOString());
 }
 
+/**
+ * Marks an approved token as 'consumed' so it cannot be re-used.
+ * Only succeeds if the token is currently 'approved'.
+ */
+export function consumeApproval(token: string): boolean {
+  const db = getApprovalsDb();
+  const stmt = db.prepare(
+    `UPDATE approvals SET status = 'consumed' WHERE token = ? AND status = 'approved'`,
+  );
+  const info = stmt.run(token);
+  return info.changes > 0;
+}
+
 /** Convert a raw SQLite row to a typed {@link ApprovalToken}. */
 function parseApprovalRow(row: RawApprovalRow): ApprovalToken {
   return {

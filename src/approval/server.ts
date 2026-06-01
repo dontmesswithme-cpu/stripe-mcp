@@ -52,6 +52,16 @@ export function startApprovalServer(): Server | null {
     const token = match[1]!;
     const action = match[2] ?? "";
 
+    // ── Authentication Check for Mutations ──────────────────────
+    if (req.method === "POST") {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || authHeader !== `Bearer ${config.approvalApiKey}`) {
+        res.writeHead(401);
+        res.end(JSON.stringify({ error: "Unauthorized. Provide Bearer token." }));
+        return;
+      }
+    }
+
     // ── GET /approvals/:token ───────────────────────────────────
     if (req.method === "GET" && action === "") {
       const approval = getApproval(token);

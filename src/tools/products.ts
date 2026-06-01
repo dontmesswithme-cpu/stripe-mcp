@@ -63,7 +63,7 @@ export async function createProduct(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    () => {
+    (options) => {
       const createParams: Stripe.ProductCreateParams = {
         name: input.name,
         description: input.description,
@@ -81,7 +81,7 @@ export async function createProduct(
         };
       }
 
-      return stripe.products.create(createParams);
+      return stripe.products.create(createParams, options);
     },
   );
 }
@@ -158,7 +158,7 @@ export async function createPrice(
       currency: input.currency,
       params: input as Record<string, unknown>,
     },
-    () => {
+    (options) => {
       const createParams: Stripe.PriceCreateParams = {
         unit_amount: input.unit_amount,
         currency: input.currency,
@@ -176,7 +176,7 @@ export async function createPrice(
         };
       }
 
-      return stripe.prices.create(createParams);
+      return stripe.prices.create(createParams, options);
     },
   );
 }
