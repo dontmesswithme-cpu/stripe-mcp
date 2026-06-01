@@ -194,6 +194,7 @@ export interface PurgeResult {
   readonly dry_run: boolean;
   readonly count: number;
   readonly customers: readonly string[];
+  readonly errors: readonly { id: string; error: string }[];
 }
 
 // ═════════════════════════════════════════════════════════════════════

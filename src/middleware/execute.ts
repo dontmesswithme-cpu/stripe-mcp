@@ -198,12 +198,16 @@ export async function executeStripeOperation<T>(
       metadata.risk_reasons = riskResult.reasons;
     }
 
-    writeAuditEntry(
-      context,
-      "success",
-      riskResult ? riskResult.total : null,
-      metadata,
-    );
+    try {
+      writeAuditEntry(
+        context,
+        "success",
+        riskResult ? riskResult.total : null,
+        metadata,
+      );
+    } catch (auditError) {
+      console.error(`stripe-mcp CRITICAL: Failed to write audit log for successful operation.`, auditError);
+    }
 
     return { success: true, data: result };
 

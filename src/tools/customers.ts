@@ -307,40 +307,43 @@ export async function purgeExpiredCustomers(
       params: input as Record<string, unknown>,
     },
     async (options) => {
-      const searchResult = await stripe.customers.search({
-        query: 'metadata["archived"]:"true"',
-        limit: 100,
-      }, options);
-
       const now = new Date();
-      const expired = searchResult.data.filter((c) => {
-        const deleteAfter = c.metadata?.delete_after;
-        if (!deleteAfter) return false;
-        return new Date(deleteAfter) <= now;
-      });
+      const expiredIds: string[] = [];
+      
+      // Auto-paginate through all results
+      for await (const customer of stripe.customers.search({ query: 'metadata["archived"]:"true"' }, options)) {
+        const deleteAfter = customer.metadata?.delete_after;
+        if (deleteAfter && new Date(deleteAfter) <= now) {
+          expiredIds.push(customer.id);
+        }
+      }
 
       if (input.dry_run === true) {
-        return {
-          dry_run: true,
-          count: expired.length,
-          customers: expired.map((c) => c.id),
+        return { 
+          dry_run: true, 
+          count: expiredIds.length, 
+          customers: expiredIds, 
+          errors: [] 
         } as PurgeResult;
       }
 
       const deleted: string[] = [];
-      for (const customer of expired) {
+      const errors: { id: string; error: string }[] = [];
+      
+      for (const id of expiredIds) {
         try {
-          await stripe.customers.del(customer.id, options);
-          deleted.push(customer.id);
-        } catch {
-          /* skip failed deletes */
+          await stripe.customers.del(id, options);
+          deleted.push(id);
+        } catch (error: any) {
+          errors.push({ id, error: error.message || "Unknown error" });
         }
       }
 
-      return {
-        dry_run: false,
-        count: deleted.length,
-        customers: deleted,
+      return { 
+        dry_run: false, 
+        count: deleted.length, 
+        customers: deleted, 
+        errors 
       } as PurgeResult;
     },
   );
