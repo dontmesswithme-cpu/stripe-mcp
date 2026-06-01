@@ -11,18 +11,32 @@
 import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
+import { executeStripeOperation } from "../middleware/execute.js";
+import { config } from "../config.js";
 import type {
+  ArchiveCustomerInput,
   CreateCustomerInput,
   DeleteCustomerInput,
   ListCustomersInput,
   McpToolResponse,
+  PurgeExpiredCustomersInput,
+  PurgeResult,
   RetrieveCustomerInput,
+  ToolCapability,
   UpdateCustomerInput,
 } from "../types.js";
 
 // ═════════════════════════════════════════════════════════════════════
 // § createCustomer
 // ═════════════════════════════════════════════════════════════════════
+
+const createCustomerCapability: ToolCapability = {
+  tool: "create_customer",
+  operation: "create",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
 
 /**
  * Create a new Stripe customer.
@@ -40,19 +54,23 @@ import type {
 export async function createCustomer(
   input: CreateCustomerInput,
 ): Promise<McpToolResponse<Stripe.Customer>> {
-  try {
-    const customer = await stripe.customers.create({
-      email: input.email,
-      name: input.name,
-      description: input.description,
-      phone: input.phone,
-      metadata: input.metadata,
-    });
-
-    return { success: true, data: customer };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+  return executeStripeOperation(
+    {
+      capability: createCustomerCapability,
+      customerId: undefined,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () =>
+      stripe.customers.create({
+        email: input.email,
+        name: input.name,
+        description: input.description,
+        phone: input.phone,
+        metadata: input.metadata,
+      }),
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -103,6 +121,14 @@ export async function retrieveCustomer(
 // § updateCustomer
 // ═════════════════════════════════════════════════════════════════════
 
+const updateCustomerCapability: ToolCapability = {
+  tool: "update_customer",
+  operation: "update",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
+
 /**
  * Update an existing Stripe customer.
  *
@@ -119,26 +145,39 @@ export async function retrieveCustomer(
 export async function updateCustomer(
   input: UpdateCustomerInput,
 ): Promise<McpToolResponse<Stripe.Customer>> {
-  try {
-    const { customer_id, ...params } = input;
+  return executeStripeOperation(
+    {
+      capability: updateCustomerCapability,
+      customerId: input.customer_id,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () => {
+      const { customer_id, ...params } = input;
 
-    const customer = await stripe.customers.update(customer_id, {
-      email: params.email,
-      name: params.name,
-      description: params.description,
-      phone: params.phone,
-      metadata: params.metadata,
-    });
-
-    return { success: true, data: customer };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      return stripe.customers.update(customer_id, {
+        email: params.email,
+        name: params.name,
+        description: params.description,
+        phone: params.phone,
+        metadata: params.metadata,
+      });
+    },
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════
 // § deleteCustomer
 // ═════════════════════════════════════════════════════════════════════
+
+const deleteCustomerCapability: ToolCapability = {
+  tool: "delete_customer",
+  operation: "delete",
+  readOnly: false,
+  riskScored: true,
+  approvalEligible: true,
+};
 
 /**
  * Permanently delete a Stripe customer.
@@ -155,13 +194,156 @@ export async function updateCustomer(
 export async function deleteCustomer(
   input: DeleteCustomerInput,
 ): Promise<McpToolResponse<Stripe.DeletedCustomer>> {
-  try {
-    const deleted = await stripe.customers.del(input.customer_id);
-
-    return { success: true, data: deleted };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
+  if (!input.force) {
+    return {
+      success: false,
+      error: {
+        code: "confirmation_required",
+        type: "invalid_request_error",
+        message:
+          "Set force: true to confirm permanent deletion. Consider using archive_customer instead.",
+      },
+    };
   }
+
+  return executeStripeOperation(
+    {
+      capability: deleteCustomerCapability,
+      customerId: input.customer_id,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () => stripe.customers.del(input.customer_id),
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// § archiveCustomer
+// ═════════════════════════════════════════════════════════════════════
+
+const archiveCustomerCapability: ToolCapability = {
+  tool: "archive_customer",
+  operation: "archive",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
+
+/**
+ * Archive a Stripe customer by setting archived metadata and a
+ * `delete_after` date.
+ *
+ * @description Sets archived metadata + delete_after date on the
+ *   customer. The customer is not deleted — it is marked for future
+ *   purging by {@link purgeExpiredCustomers}.
+ * @param input - Validated {@link ArchiveCustomerInput} with the
+ *   `customer_id` to archive.
+ * @returns A {@link McpToolResponse} containing the updated
+ *   `Stripe.Customer` with archived metadata on success.
+ * @throws Never — all errors are caught and returned as structured responses.
+ */
+export async function archiveCustomer(
+  input: ArchiveCustomerInput,
+): Promise<McpToolResponse<Stripe.Customer>> {
+  return executeStripeOperation(
+    {
+      capability: archiveCustomerCapability,
+      customerId: input.customer_id,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () => {
+      const deleteAfter = new Date(
+        Date.now() + config.archiveDeleteAfterDays * 24 * 60 * 60 * 1000,
+      ).toISOString();
+
+      return stripe.customers.update(input.customer_id, {
+        metadata: {
+          archived: "true",
+          archived_at: new Date().toISOString(),
+          delete_after: deleteAfter,
+        },
+      });
+    },
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// § purgeExpiredCustomers
+// ═════════════════════════════════════════════════════════════════════
+
+const purgeExpiredCustomersCapability: ToolCapability = {
+  tool: "purge_expired_customers",
+  operation: "purge",
+  readOnly: false,
+  riskScored: true,
+  approvalEligible: true,
+};
+
+/**
+ * Purge customers whose `delete_after` date has passed.
+ *
+ * @description Searches for customers with `archived: "true"` metadata
+ *   whose `delete_after` timestamp is in the past. In dry-run mode,
+ *   returns the list without deleting. Otherwise, permanently deletes
+ *   each expired customer.
+ * @param input - Validated {@link PurgeExpiredCustomersInput}. `dry_run`
+ *   controls whether deletions are actually performed.
+ * @returns A {@link McpToolResponse} containing a {@link PurgeResult}
+ *   with the count and IDs of purged (or purgeable) customers.
+ * @throws Never — all errors are caught and returned as structured responses.
+ */
+export async function purgeExpiredCustomers(
+  input: PurgeExpiredCustomersInput,
+): Promise<McpToolResponse<PurgeResult>> {
+  return executeStripeOperation(
+    {
+      capability: purgeExpiredCustomersCapability,
+      customerId: undefined,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    async () => {
+      const searchResult = await stripe.customers.search({
+        query: 'metadata["archived"]:"true"',
+        limit: 100,
+      });
+
+      const now = new Date();
+      const expired = searchResult.data.filter((c) => {
+        const deleteAfter = c.metadata?.delete_after;
+        if (!deleteAfter) return false;
+        return new Date(deleteAfter) <= now;
+      });
+
+      if (input.dry_run === true) {
+        return {
+          dry_run: true,
+          count: expired.length,
+          customers: expired.map((c) => c.id),
+        } as PurgeResult;
+      }
+
+      const deleted: string[] = [];
+      for (const customer of expired) {
+        try {
+          await stripe.customers.del(customer.id);
+          deleted.push(customer.id);
+        } catch {
+          /* skip failed deletes */
+        }
+      }
+
+      return {
+        dry_run: false,
+        count: deleted.length,
+        customers: deleted,
+      } as PurgeResult;
+    },
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════

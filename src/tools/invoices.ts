@@ -11,7 +11,9 @@
 import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
+import { executeStripeOperation } from "../middleware/execute.js";
 import type {
+  ToolCapability,
   ListInvoicesInput,
   McpToolResponse,
   PayInvoiceInput,
@@ -88,6 +90,14 @@ export async function listInvoices(
 // § payInvoice
 // ═════════════════════════════════════════════════════════════════════
 
+const payInvoiceCapability: ToolCapability = {
+  tool: "pay_invoice",
+  operation: "pay",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
+
 /**
  * Attempt payment on an open Stripe invoice.
  *
@@ -114,23 +124,28 @@ export async function listInvoices(
 export async function payInvoice(
   input: PayInvoiceInput,
 ): Promise<McpToolResponse<Stripe.Invoice>> {
-  try {
-    const payParams: Stripe.InvoicePayParams = {};
+  return executeStripeOperation(
+    {
+      capability: payInvoiceCapability,
+      customerId: undefined,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () => {
+      const payParams: Stripe.InvoicePayParams = {};
 
-    if (input.payment_method !== undefined) {
-      payParams.payment_method = input.payment_method;
-    }
-    if (input.forgive !== undefined) {
-      payParams.forgive = input.forgive;
-    }
-    if (input.off_session !== undefined) {
-      payParams.off_session = input.off_session;
-    }
+      if (input.payment_method !== undefined) {
+        payParams.payment_method = input.payment_method;
+      }
+      if (input.forgive !== undefined) {
+        payParams.forgive = input.forgive;
+      }
+      if (input.off_session !== undefined) {
+        payParams.off_session = input.off_session;
+      }
 
-    const invoice = await stripe.invoices.pay(input.invoice_id, payParams);
-
-    return { success: true, data: invoice };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      return stripe.invoices.pay(input.invoice_id, payParams);
+    },
+  );
 }

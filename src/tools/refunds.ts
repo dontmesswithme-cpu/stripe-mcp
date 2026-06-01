@@ -11,7 +11,9 @@
 import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
+import { executeStripeOperation } from "../middleware/execute.js";
 import type {
+  ToolCapability,
   CreateRefundInput,
   ListRefundsInput,
   McpToolResponse,
@@ -20,6 +22,14 @@ import type {
 // ═════════════════════════════════════════════════════════════════════
 // § createRefund
 // ═════════════════════════════════════════════════════════════════════
+
+const createRefundCapability: ToolCapability = {
+  tool: "create_refund",
+  operation: "refund",
+  readOnly: false,
+  riskScored: true,
+  approvalEligible: true,
+};
 
 /**
  * Create a refund for a charge or payment intent.
@@ -64,19 +74,23 @@ export async function createRefund(
     };
   }
 
-  try {
-    const refund = await stripe.refunds.create({
-      payment_intent: input.payment_intent,
-      charge: input.charge,
+  return executeStripeOperation(
+    {
+      capability: createRefundCapability,
+      customerId: undefined,
       amount: input.amount,
-      reason: input.reason,
-      metadata: input.metadata,
-    });
-
-    return { success: true, data: refund };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () =>
+      stripe.refunds.create({
+        payment_intent: input.payment_intent,
+        charge: input.charge,
+        amount: input.amount,
+        reason: input.reason,
+        metadata: input.metadata,
+      }),
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════

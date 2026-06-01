@@ -53,6 +53,147 @@ export type McpToolResponse<T> =
   | { readonly success: false; readonly error: ToolError };
 
 // ═════════════════════════════════════════════════════════════════════
+// § v1.0.0 — Operation, Risk, Approval, and Audit Types
+// ═════════════════════════════════════════════════════════════════════
+
+/** Classification of what a tool does to a Stripe resource. */
+export type OperationType =
+  | "create"
+  | "update"
+  | "delete"
+  | "cancel"
+  | "refund"
+  | "pay"
+  | "confirm"
+  | "archive"
+  | "purge";
+
+/** Capabilities a tool declares — drives middleware behavior. */
+export interface ToolCapability {
+  /** The registered MCP tool name (e.g. "create_refund"). */
+  readonly tool: string;
+  /** Mutation classification. */
+  readonly operation: OperationType;
+  /** True for retrieve/list tools — bypasses middleware entirely. */
+  readonly readOnly: boolean;
+  /** True if this operation should be scored by the risk engine. */
+  readonly riskScored: boolean;
+  /** True if this operation can require approval above a threshold. */
+  readonly approvalEligible: boolean;
+}
+
+/** Full context passed into executeStripeOperation. */
+export interface OperationContext {
+  /** Tool capability descriptor. */
+  readonly capability: ToolCapability;
+  /** Stripe customer ID, if applicable. */
+  readonly customerId?: string;
+  /** Monetary amount in smallest currency unit, if applicable. */
+  readonly amount?: number;
+  /** ISO 4217 currency code, if applicable. */
+  readonly currency?: string;
+  /** Serializable snapshot of the input params (for audit + approval storage). */
+  readonly params: Record<string, unknown>;
+}
+
+/** Outcome tiers from the risk engine. */
+export type RiskOutcome = "allow" | "flag" | "block";
+
+/** A single contributing signal in a risk assessment. */
+export interface RiskFactor {
+  /** Machine-readable factor name (e.g. "high_amount"). */
+  readonly name: string;
+  /** Human-readable explanation. */
+  readonly description: string;
+  /** Points this factor contributed. */
+  readonly points: number;
+}
+
+/** Complete risk assessment for an operation. */
+export interface RiskScore {
+  /** Total score (0–100+). */
+  readonly total: number;
+  /** Derived outcome: allow (0–39), flag (40–69), block (70+). */
+  readonly outcome: RiskOutcome;
+  /** Every factor that contributed to the score. */
+  readonly factors: readonly RiskFactor[];
+  /** Human-readable summary reasons. */
+  readonly reasons: readonly string[];
+}
+
+/** Lifecycle status of an approval token. */
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
+
+/** Persisted approval token record. */
+export interface ApprovalToken {
+  /** Unique token (UUIDv4). */
+  readonly token: string;
+  /** MCP tool name that triggered the approval. */
+  readonly tool: string;
+  /** Operation type. */
+  readonly operation: OperationType;
+  /** Current lifecycle status. */
+  readonly status: ApprovalStatus;
+  /** ISO 8601 creation timestamp. */
+  readonly createdAt: string;
+  /** ISO 8601 expiry timestamp. */
+  readonly expiresAt: string;
+  /** Who/what requested this. */
+  readonly requestedBy: string;
+  /** Risk score at time of creation. */
+  readonly riskScore: number;
+  /** Serialized operation parameters. */
+  readonly params: Record<string, unknown>;
+}
+
+/** A single audit log entry. */
+export interface AuditEntry {
+  /** Auto-increment ID. */
+  readonly id: number;
+  /** ISO 8601 timestamp. */
+  readonly timestamp: string;
+  /** MCP tool name. */
+  readonly toolName: string;
+  /** Stripe customer ID, if applicable. */
+  readonly customerId: string | null;
+  /** Operation classification. */
+  readonly operationType: OperationType;
+  /** Amount in smallest currency unit, if applicable. */
+  readonly amount: number | null;
+  /** ISO 4217 currency, if applicable. */
+  readonly currency: string | null;
+  /** Outcome of the operation. */
+  readonly outcome:
+    | "success"
+    | "error"
+    | "blocked"
+    | "dry_run"
+    | "pending_approval";
+  /** Risk score, if computed. */
+  readonly riskScore: number | null;
+  /** Arbitrary JSON metadata. */
+  readonly metadata: Record<string, unknown>;
+}
+
+/** Filters for querying the audit log. */
+export interface AuditFilters {
+  readonly customerId?: string;
+  readonly toolName?: string;
+  readonly operationType?: OperationType;
+  readonly outcome?: AuditEntry["outcome"];
+  readonly startDate?: string;
+  readonly endDate?: string;
+  readonly limit?: number;
+}
+
+/** Result of purgeExpiredCustomers. */
+export interface PurgeResult {
+  readonly dry_run: boolean;
+  readonly count: number;
+  readonly customers: readonly string[];
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // § Shared Sub-schemas (DRY building blocks)
 // ═════════════════════════════════════════════════════════════════════
 
@@ -166,7 +307,13 @@ export const DeleteCustomerSchema = z.object({
   customer_id: z
     .string()
     .startsWith("cus_")
-    .describe("The unique Stripe customer ID to permanently delete."),
+    .describe("The customer ID to permanently delete."),
+  force: z
+    .boolean()
+    .describe(
+      "Must be true to confirm permanent deletion. This action is " +
+        "irreversible. Consider using archive_customer instead.",
+    ),
 });
 export type DeleteCustomerInput = z.infer<typeof DeleteCustomerSchema>;
 
@@ -796,3 +943,81 @@ export const RetrieveChargeSchema = z.object({
     .describe("The unique Stripe charge ID (e.g. ch_ABC123)."),
 });
 export type RetrieveChargeInput = z.infer<typeof RetrieveChargeSchema>;
+
+// ═════════════════════════════════════════════════════════════════════
+// § v1.0.0 — Archive, Purge, Audit, Approval Schemas
+// ═════════════════════════════════════════════════════════════════════
+
+export const ArchiveCustomerSchema = z.object({
+  customer_id: z
+    .string()
+    .startsWith("cus_")
+    .describe("The customer ID to archive (soft delete)."),
+});
+export type ArchiveCustomerInput = z.infer<typeof ArchiveCustomerSchema>;
+
+export const PurgeExpiredCustomersSchema = z.object({
+  dry_run: z
+    .boolean()
+    .optional()
+    .describe(
+      "If true, list customers that would be purged without deleting them.",
+    ),
+});
+export type PurgeExpiredCustomersInput = z.infer<
+  typeof PurgeExpiredCustomersSchema
+>;
+
+export const GetAuditLogSchema = z.object({
+  customer_id: z
+    .string()
+    .startsWith("cus_")
+    .optional()
+    .describe("Filter by customer ID."),
+  tool_name: z
+    .string()
+    .optional()
+    .describe("Filter by tool name (e.g. 'create_refund')."),
+  operation_type: z
+    .enum([
+      "create",
+      "update",
+      "delete",
+      "cancel",
+      "refund",
+      "pay",
+      "confirm",
+      "archive",
+      "purge",
+    ])
+    .optional()
+    .describe("Filter by operation type."),
+  outcome: z
+    .enum(["success", "error", "blocked", "dry_run", "pending_approval"])
+    .optional()
+    .describe("Filter by outcome."),
+  start_date: z
+    .string()
+    .optional()
+    .describe("ISO 8601 start date (inclusive)."),
+  end_date: z
+    .string()
+    .optional()
+    .describe("ISO 8601 end date (inclusive)."),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(500)
+    .optional()
+    .describe("Max entries to return (default 50)."),
+});
+export type GetAuditLogInput = z.infer<typeof GetAuditLogSchema>;
+
+export const GetApprovalStatusSchema = z.object({
+  token: z
+    .string()
+    .uuid()
+    .describe("The approval token UUID to check."),
+});
+export type GetApprovalStatusInput = z.infer<typeof GetApprovalStatusSchema>;

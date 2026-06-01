@@ -15,7 +15,9 @@
 import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
+import { executeStripeOperation } from "../middleware/execute.js";
 import type {
+  ToolCapability,
   CreatePriceInput,
   CreateProductInput,
   ListPricesInput,
@@ -26,6 +28,14 @@ import type {
 // ═════════════════════════════════════════════════════════════════════
 // § createProduct
 // ═════════════════════════════════════════════════════════════════════
+
+const createProductCapability: ToolCapability = {
+  tool: "create_product",
+  operation: "create",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
 
 /**
  * Create a new product in the Stripe catalog.
@@ -45,30 +55,35 @@ import type {
 export async function createProduct(
   input: CreateProductInput,
 ): Promise<McpToolResponse<Stripe.Product>> {
-  try {
-    const createParams: Stripe.ProductCreateParams = {
-      name: input.name,
-      description: input.description,
-      active: input.active,
-      images: input.images,
-      metadata: input.metadata,
-    };
-
-    // Build the inline default price data when provided.
-    if (input.default_price_data !== undefined) {
-      createParams.default_price_data = {
-        unit_amount: input.default_price_data.unit_amount,
-        currency: input.default_price_data.currency,
-        recurring: input.default_price_data.recurring,
+  return executeStripeOperation(
+    {
+      capability: createProductCapability,
+      customerId: undefined,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () => {
+      const createParams: Stripe.ProductCreateParams = {
+        name: input.name,
+        description: input.description,
+        active: input.active,
+        images: input.images,
+        metadata: input.metadata,
       };
-    }
 
-    const product = await stripe.products.create(createParams);
+      // Build the inline default price data when provided.
+      if (input.default_price_data !== undefined) {
+        createParams.default_price_data = {
+          unit_amount: input.default_price_data.unit_amount,
+          currency: input.default_price_data.currency,
+          recurring: input.default_price_data.recurring,
+        };
+      }
 
-    return { success: true, data: product };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      return stripe.products.create(createParams);
+    },
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -109,6 +124,14 @@ export async function listProducts(
 // § createPrice
 // ═════════════════════════════════════════════════════════════════════
 
+const createPriceCapability: ToolCapability = {
+  tool: "create_price",
+  operation: "create",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
+
 /**
  * Create a new price for an existing Stripe product.
  *
@@ -127,30 +150,35 @@ export async function listProducts(
 export async function createPrice(
   input: CreatePriceInput,
 ): Promise<McpToolResponse<Stripe.Price>> {
-  try {
-    const createParams: Stripe.PriceCreateParams = {
-      unit_amount: input.unit_amount,
+  return executeStripeOperation(
+    {
+      capability: createPriceCapability,
+      customerId: undefined,
+      amount: input.unit_amount,
       currency: input.currency,
-      product: input.product,
-      nickname: input.nickname,
-      metadata: input.metadata,
-    };
-
-    // Only attach recurring when explicitly provided — omitting it
-    // creates a one-time price.
-    if (input.recurring !== undefined) {
-      createParams.recurring = {
-        interval: input.recurring.interval,
-        interval_count: input.recurring.interval_count,
+      params: input as Record<string, unknown>,
+    },
+    () => {
+      const createParams: Stripe.PriceCreateParams = {
+        unit_amount: input.unit_amount,
+        currency: input.currency,
+        product: input.product,
+        nickname: input.nickname,
+        metadata: input.metadata,
       };
-    }
 
-    const price = await stripe.prices.create(createParams);
+      // Only attach recurring when explicitly provided — omitting it
+      // creates a one-time price.
+      if (input.recurring !== undefined) {
+        createParams.recurring = {
+          interval: input.recurring.interval,
+          interval_count: input.recurring.interval_count,
+        };
+      }
 
-    return { success: true, data: price };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      return stripe.prices.create(createParams);
+    },
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════

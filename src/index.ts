@@ -3,10 +3,12 @@
 /**
  * @module stripe-mcp
  *
- * Entry point for the Stripe MCP server.
+ * Entry point for the Stripe MCP server (v1.0.0).
  *
  * - Validates required environment variables at startup.
- * - Registers 25 MCP tools across 7 Stripe domains.
+ * - Initializes SQLite databases for audit logging and approvals.
+ * - Starts the approval HTTP server (configurable port).
+ * - Registers 29 MCP tools across 9 domains.
  * - Connects via stdio transport (stdout is reserved for MCP protocol;
  *   all diagnostic output is written to stderr).
  * - Handles SIGINT / SIGTERM for graceful shutdown.
@@ -21,6 +23,10 @@ import { dirname, resolve } from "node:path";
 // ── Eagerly validate Stripe client (env check at module load) ───────
 import "./stripe-client.js";
 
+// ── Infrastructure ──────────────────────────────────────────────────
+import { closeAllDatabases } from "./utils/db.js";
+import { startApprovalServer } from "./approval/server.js";
+
 // ── Tool handlers ───────────────────────────────────────────────────
 
 import {
@@ -29,6 +35,8 @@ import {
   updateCustomer,
   deleteCustomer,
   listCustomers,
+  archiveCustomer,
+  purgeExpiredCustomers,
 } from "./tools/customers.js";
 
 import {
@@ -64,6 +72,8 @@ import { retrieveBalance } from "./tools/balance.js";
 
 import { createRefund, listRefunds } from "./tools/refunds.js";
 
+import { getAuditLog, getApprovalStatus } from "./tools/audit.js";
+
 // ── Zod schemas (for server.tool() registration) ────────────────────
 
 import {
@@ -73,6 +83,8 @@ import {
   UpdateCustomerSchema,
   DeleteCustomerSchema,
   ListCustomersSchema,
+  ArchiveCustomerSchema,
+  PurgeExpiredCustomersSchema,
 
   // Payment Intents
   CreatePaymentIntentSchema,
@@ -106,6 +118,10 @@ import {
   // so .shape is accessible. The handler validates the XOR constraint.
   CreateRefundFields,
   ListRefundsSchema,
+
+  // Admin
+  GetAuditLogSchema,
+  GetApprovalStatusSchema,
 } from "./types.js";
 
 import type { McpToolResponse } from "./types.js";
@@ -139,11 +155,15 @@ function formatResponse<T>(result: McpToolResponse<T>): {
 } {
   if (result.success) {
     return {
-      content: [{ type: "text" as const, text: JSON.stringify(result.data, null, 2) }],
+      content: [
+        { type: "text" as const, text: JSON.stringify(result.data, null, 2) },
+      ],
     };
   }
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(result.error, null, 2) }],
+    content: [
+      { type: "text" as const, text: JSON.stringify(result.error, null, 2) },
+    ],
     isError: true,
   };
 }
@@ -156,8 +176,11 @@ async function main(): Promise<void> {
     version: pkg.version,
   });
 
+  // ── Start approval HTTP server ──────────────────────────────────
+  startApprovalServer();
+
   // ────────────────────────────────────────────────────────────────
-  // § Customer Tools
+  // § Customer Tools (7)
   // ────────────────────────────────────────────────────────────────
 
   server.tool(
@@ -183,7 +206,7 @@ async function main(): Promise<void> {
 
   server.tool(
     "delete_customer",
-    "Permanently delete a customer and cancel all their active subscriptions. This is irreversible.",
+    "Permanently delete a customer. Requires force: true. Routes through risk engine and approval. Consider archive_customer instead.",
     DeleteCustomerSchema.shape,
     async (args) => formatResponse(await deleteCustomer(args)),
   );
@@ -195,8 +218,22 @@ async function main(): Promise<void> {
     async (args) => formatResponse(await listCustomers(args)),
   );
 
+  server.tool(
+    "archive_customer",
+    "Soft-delete a customer by setting archived metadata. The customer remains in Stripe but is flagged for future purge.",
+    ArchiveCustomerSchema.shape,
+    async (args) => formatResponse(await archiveCustomer(args)),
+  );
+
+  server.tool(
+    "purge_expired_customers",
+    "Find and permanently delete customers whose archive period has expired. Use dry_run: true to preview.",
+    PurgeExpiredCustomersSchema.shape,
+    async (args) => formatResponse(await purgeExpiredCustomers(args)),
+  );
+
   // ────────────────────────────────────────────────────────────────
-  // § Payment Intent Tools
+  // § Payment Intent Tools (5)
   // ────────────────────────────────────────────────────────────────
 
   server.tool(
@@ -235,7 +272,7 @@ async function main(): Promise<void> {
   );
 
   // ────────────────────────────────────────────────────────────────
-  // § Subscription Tools
+  // § Subscription Tools (5)
   // ────────────────────────────────────────────────────────────────
 
   server.tool(
@@ -261,7 +298,7 @@ async function main(): Promise<void> {
 
   server.tool(
     "cancel_subscription",
-    "Cancel a subscription immediately or at the end of the current billing period.",
+    "Cancel a subscription immediately or at the end of the current billing period. Routes through risk engine.",
     CancelSubscriptionSchema.shape,
     async (args) => formatResponse(await cancelSubscription(args)),
   );
@@ -274,7 +311,7 @@ async function main(): Promise<void> {
   );
 
   // ────────────────────────────────────────────────────────────────
-  // § Product & Price Tools
+  // § Product & Price Tools (4)
   // ────────────────────────────────────────────────────────────────
 
   server.tool(
@@ -306,7 +343,7 @@ async function main(): Promise<void> {
   );
 
   // ────────────────────────────────────────────────────────────────
-  // § Invoice Tools
+  // § Invoice Tools (3)
   // ────────────────────────────────────────────────────────────────
 
   server.tool(
@@ -331,7 +368,7 @@ async function main(): Promise<void> {
   );
 
   // ────────────────────────────────────────────────────────────────
-  // § Balance Tools
+  // § Balance Tools (1)
   // ────────────────────────────────────────────────────────────────
 
   server.tool(
@@ -342,12 +379,12 @@ async function main(): Promise<void> {
   );
 
   // ────────────────────────────────────────────────────────────────
-  // § Refund Tools
+  // § Refund Tools (2)
   // ────────────────────────────────────────────────────────────────
 
   server.tool(
     "create_refund",
-    "Refund a charge or payment intent — fully or partially. Provide exactly one of payment_intent or charge.",
+    "Refund a charge or payment intent — fully or partially. Routes through risk engine and approval for high-value refunds.",
     CreateRefundFields.shape,
     async (args) => formatResponse(await createRefund(args)),
   );
@@ -359,13 +396,31 @@ async function main(): Promise<void> {
     async (args) => formatResponse(await listRefunds(args)),
   );
 
+  // ────────────────────────────────────────────────────────────────
+  // § Admin Tools (2)
+  // ────────────────────────────────────────────────────────────────
+
+  server.tool(
+    "get_audit_log",
+    "Query the operation audit log. Filter by customer, tool, operation type, outcome, or date range.",
+    GetAuditLogSchema.shape,
+    async (args) => formatResponse(await getAuditLog(args)),
+  );
+
+  server.tool(
+    "get_approval_status",
+    "Check the status of an approval token (pending, approved, rejected, expired).",
+    GetApprovalStatusSchema.shape,
+    async (args) => formatResponse(await getApprovalStatus(args)),
+  );
+
   // ── Transport & Lifecycle ──────────────────────────────────────
 
   const transport = new StdioServerTransport();
 
   /**
    * Graceful shutdown on SIGINT / SIGTERM.
-   * Closes the MCP server (flushes pending responses) before exiting.
+   * Closes MCP server, flushes databases, then exits.
    */
   const shutdown = async (signal: string): Promise<void> => {
     console.error(`\nstripe-mcp: received ${signal}, shutting down…`);
@@ -374,6 +429,7 @@ async function main(): Promise<void> {
     } catch {
       // Best-effort — transport may already be closed.
     }
+    closeAllDatabases();
     process.exit(0);
   };
 
@@ -383,7 +439,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   console.error(
-    `stripe-mcp v${pkg.version} ready — 25 tools registered, listening on stdio`,
+    `stripe-mcp v${pkg.version} ready — 29 tools registered, listening on stdio`,
   );
 }
 

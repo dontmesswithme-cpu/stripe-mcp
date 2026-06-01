@@ -11,18 +11,28 @@
 import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
+import { executeStripeOperation } from "../middleware/execute.js";
 import type {
   CancelSubscriptionInput,
   CreateSubscriptionInput,
   ListSubscriptionsInput,
   McpToolResponse,
   RetrieveSubscriptionInput,
+  ToolCapability,
   UpdateSubscriptionInput,
 } from "../types.js";
 
 // ═════════════════════════════════════════════════════════════════════
 // § createSubscription
 // ═════════════════════════════════════════════════════════════════════
+
+const createSubscriptionCapability: ToolCapability = {
+  tool: "create_subscription",
+  operation: "create",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
 
 /**
  * Create a new Stripe subscription for a customer.
@@ -42,22 +52,26 @@ import type {
 export async function createSubscription(
   input: CreateSubscriptionInput,
 ): Promise<McpToolResponse<Stripe.Subscription>> {
-  try {
-    const subscription = await stripe.subscriptions.create({
-      customer: input.customer,
-      items: input.items.map((item) => ({
-        price: item.price,
-        quantity: item.quantity,
-      })),
-      payment_behavior: input.payment_behavior,
-      collection_method: input.collection_method,
-      metadata: input.metadata,
-    });
-
-    return { success: true, data: subscription };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+  return executeStripeOperation(
+    {
+      capability: createSubscriptionCapability,
+      customerId: input.customer,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () =>
+      stripe.subscriptions.create({
+        customer: input.customer,
+        items: input.items.map((item) => ({
+          price: item.price,
+          quantity: item.quantity,
+        })),
+        payment_behavior: input.payment_behavior,
+        collection_method: input.collection_method,
+        metadata: input.metadata,
+      }),
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -95,6 +109,14 @@ export async function retrieveSubscription(
 // § updateSubscription
 // ═════════════════════════════════════════════════════════════════════
 
+const updateSubscriptionCapability: ToolCapability = {
+  tool: "update_subscription",
+  operation: "update",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
+
 /**
  * Update an existing Stripe subscription.
  *
@@ -112,39 +134,49 @@ export async function retrieveSubscription(
 export async function updateSubscription(
   input: UpdateSubscriptionInput,
 ): Promise<McpToolResponse<Stripe.Subscription>> {
-  try {
-    const { subscription_id, ...params } = input;
+  return executeStripeOperation(
+    {
+      capability: updateSubscriptionCapability,
+      customerId: undefined,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () => {
+      const { subscription_id, ...params } = input;
 
-    const updateParams: Stripe.SubscriptionUpdateParams = {
-      cancel_at_period_end: params.cancel_at_period_end,
-      proration_behavior: params.proration_behavior,
-      metadata: params.metadata,
-    };
+      const updateParams: Stripe.SubscriptionUpdateParams = {
+        cancel_at_period_end: params.cancel_at_period_end,
+        proration_behavior: params.proration_behavior,
+        metadata: params.metadata,
+      };
 
-    // Map items only when provided — each item can be an add, update, or delete.
-    if (params.items !== undefined) {
-      updateParams.items = params.items.map((item) => ({
-        id: item.id,
-        price: item.price,
-        quantity: item.quantity,
-        deleted: item.deleted,
-      }));
-    }
+      // Map items only when provided — each item can be an add, update, or delete.
+      if (params.items !== undefined) {
+        updateParams.items = params.items.map((item) => ({
+          id: item.id,
+          price: item.price,
+          quantity: item.quantity,
+          deleted: item.deleted,
+        }));
+      }
 
-    const subscription = await stripe.subscriptions.update(
-      subscription_id,
-      updateParams,
-    );
-
-    return { success: true, data: subscription };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      return stripe.subscriptions.update(subscription_id, updateParams);
+    },
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════
 // § cancelSubscription
 // ═════════════════════════════════════════════════════════════════════
+
+const cancelSubscriptionCapability: ToolCapability = {
+  tool: "cancel_subscription",
+  operation: "cancel",
+  readOnly: false,
+  riskScored: true,
+  approvalEligible: true,
+};
 
 /**
  * Cancel a Stripe subscription — immediately or at period end.
@@ -172,39 +204,38 @@ export async function updateSubscription(
 export async function cancelSubscription(
   input: CancelSubscriptionInput,
 ): Promise<McpToolResponse<Stripe.Subscription>> {
-  try {
-    // ── End-of-period cancellation ─────────────────────────────
-    // Uses update (not cancel) because Stripe's cancel endpoint
-    // always terminates immediately. Setting cancel_at_period_end
-    // via update schedules cancellation at the billing cycle boundary.
-    if (input.cancel_at_period_end === true) {
-      const subscription = await stripe.subscriptions.update(
-        input.subscription_id,
-        { cancel_at_period_end: true },
-      );
+  return executeStripeOperation(
+    {
+      capability: cancelSubscriptionCapability,
+      customerId: undefined,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    async () => {
+      // ── End-of-period cancellation ─────────────────────────────
+      // Uses update (not cancel) because Stripe's cancel endpoint
+      // always terminates immediately. Setting cancel_at_period_end
+      // via update schedules cancellation at the billing cycle boundary.
+      if (input.cancel_at_period_end === true) {
+        return stripe.subscriptions.update(input.subscription_id, {
+          cancel_at_period_end: true,
+        });
+      }
 
-      return { success: true, data: subscription };
-    }
+      // ── Immediate cancellation ─────────────────────────────────
+      const cancelParams: Stripe.SubscriptionCancelParams = {};
 
-    // ── Immediate cancellation ─────────────────────────────────
-    const cancelParams: Stripe.SubscriptionCancelParams = {};
+      if (input.invoice_now !== undefined) {
+        cancelParams.invoice_now = input.invoice_now;
+      }
+      if (input.prorate !== undefined) {
+        cancelParams.prorate = input.prorate;
+      }
 
-    if (input.invoice_now !== undefined) {
-      cancelParams.invoice_now = input.invoice_now;
-    }
-    if (input.prorate !== undefined) {
-      cancelParams.prorate = input.prorate;
-    }
-
-    const subscription = await stripe.subscriptions.cancel(
-      input.subscription_id,
-      cancelParams,
-    );
-
-    return { success: true, data: subscription };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      return stripe.subscriptions.cancel(input.subscription_id, cancelParams);
+    },
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════

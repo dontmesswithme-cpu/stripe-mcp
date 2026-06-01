@@ -11,6 +11,7 @@
 import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
+import { executeStripeOperation } from "../middleware/execute.js";
 import type {
   CancelPaymentIntentInput,
   ConfirmPaymentIntentInput,
@@ -18,11 +19,20 @@ import type {
   ListPaymentIntentsInput,
   McpToolResponse,
   RetrievePaymentIntentInput,
+  ToolCapability,
 } from "../types.js";
 
 // ═════════════════════════════════════════════════════════════════════
 // § createPaymentIntent
 // ═════════════════════════════════════════════════════════════════════
+
+const createPaymentIntentCapability: ToolCapability = {
+  tool: "create_payment_intent",
+  operation: "create",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
 
 /**
  * Create a new Stripe PaymentIntent.
@@ -44,20 +54,24 @@ import type {
 export async function createPaymentIntent(
   input: CreatePaymentIntentInput,
 ): Promise<McpToolResponse<Stripe.PaymentIntent>> {
-  try {
-    const paymentIntent = await stripe.paymentIntents.create({
+  return executeStripeOperation(
+    {
+      capability: createPaymentIntentCapability,
+      customerId: input.customer,
       amount: input.amount,
       currency: input.currency,
-      customer: input.customer,
-      description: input.description,
-      payment_method_types: input.payment_method_types,
-      metadata: input.metadata,
-    });
-
-    return { success: true, data: paymentIntent };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      params: input as Record<string, unknown>,
+    },
+    () =>
+      stripe.paymentIntents.create({
+        amount: input.amount,
+        currency: input.currency,
+        customer: input.customer,
+        description: input.description,
+        payment_method_types: input.payment_method_types,
+        metadata: input.metadata,
+      }),
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -94,6 +108,14 @@ export async function retrievePaymentIntent(
 // § confirmPaymentIntent
 // ═════════════════════════════════════════════════════════════════════
 
+const confirmPaymentIntentCapability: ToolCapability = {
+  tool: "confirm_payment_intent",
+  operation: "confirm",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
+
 /**
  * Confirm a PaymentIntent to initiate payment processing.
  *
@@ -115,27 +137,40 @@ export async function retrievePaymentIntent(
 export async function confirmPaymentIntent(
   input: ConfirmPaymentIntentInput,
 ): Promise<McpToolResponse<Stripe.PaymentIntent>> {
-  try {
-    const confirmParams: Stripe.PaymentIntentConfirmParams = {};
+  return executeStripeOperation(
+    {
+      capability: confirmPaymentIntentCapability,
+      customerId: undefined,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () => {
+      const confirmParams: Stripe.PaymentIntentConfirmParams = {};
 
-    if (input.payment_method !== undefined) {
-      confirmParams.payment_method = input.payment_method;
-    }
+      if (input.payment_method !== undefined) {
+        confirmParams.payment_method = input.payment_method;
+      }
 
-    const paymentIntent = await stripe.paymentIntents.confirm(
-      input.payment_intent_id,
-      confirmParams,
-    );
-
-    return { success: true, data: paymentIntent };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      return stripe.paymentIntents.confirm(
+        input.payment_intent_id,
+        confirmParams,
+      );
+    },
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════
 // § cancelPaymentIntent
 // ═════════════════════════════════════════════════════════════════════
+
+const cancelPaymentIntentCapability: ToolCapability = {
+  tool: "cancel_payment_intent",
+  operation: "cancel",
+  readOnly: false,
+  riskScored: false,
+  approvalEligible: false,
+};
 
 /**
  * Cancel a PaymentIntent.
@@ -156,22 +191,27 @@ export async function confirmPaymentIntent(
 export async function cancelPaymentIntent(
   input: CancelPaymentIntentInput,
 ): Promise<McpToolResponse<Stripe.PaymentIntent>> {
-  try {
-    const cancelParams: Stripe.PaymentIntentCancelParams = {};
+  return executeStripeOperation(
+    {
+      capability: cancelPaymentIntentCapability,
+      customerId: undefined,
+      amount: undefined,
+      currency: undefined,
+      params: input as Record<string, unknown>,
+    },
+    () => {
+      const cancelParams: Stripe.PaymentIntentCancelParams = {};
 
-    if (input.cancellation_reason !== undefined) {
-      cancelParams.cancellation_reason = input.cancellation_reason;
-    }
+      if (input.cancellation_reason !== undefined) {
+        cancelParams.cancellation_reason = input.cancellation_reason;
+      }
 
-    const paymentIntent = await stripe.paymentIntents.cancel(
-      input.payment_intent_id,
-      cancelParams,
-    );
-
-    return { success: true, data: paymentIntent };
-  } catch (error: unknown) {
-    return toErrorResponse(error);
-  }
+      return stripe.paymentIntents.cancel(
+        input.payment_intent_id,
+        cancelParams,
+      );
+    },
+  );
 }
 
 // ═════════════════════════════════════════════════════════════════════
