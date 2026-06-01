@@ -1,189 +1,161 @@
 # stripe-mcp
 
-Stripe API tools for AI agents, via the Model Context Protocol.
+> Production-grade Model Context Protocol (MCP) server for the Stripe API.
 
-[![npm version](https://img.shields.io/npm/v/stripe-mcp)](https://www.npmjs.com/package/stripe-mcp)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue.svg)](tsconfig.json)
+![npm version](https://img.shields.io/npm/v/stripe-mcp?style=flat-square)
+![license](https://img.shields.io/npm/l/stripe-mcp?style=flat-square)
+![TypeScript](https://img.shields.io/badge/typescript-strict-blue.svg?style=flat-square)
 
 ## What it is
+An MCP server that safely exposes Stripe's capabilities to AI agents, backed by a strict risk engine, approval workflows, and comprehensive audit logging. Built with strict TypeScript and `better-sqlite3`, it is designed for production environments where AI mutations must be auditable and tightly controlled.
 
-An MCP server that gives any compatible AI agent direct access to the Stripe API. 25 tools, strict TypeScript, Zod-validated inputs, structured error handling.
-
-- Create and confirm payment intents in any currency
-- Create, update, and delete customers with full metadata support
-- Manage subscriptions — create, upgrade, downgrade, or cancel at period end
-- Build a product catalog with recurring and one-time prices
-- Retrieve and collect payment on open invoices
-- Issue full or partial refunds against charges or payment intents
-- Check account balance broken down by available and pending amounts per currency
-- List and filter any Stripe resource with cursor-based pagination
+## What's new in 1.0.0
+- **Risk Engine:** Configurable scoring system that evaluates mutations based on velocity, amounts, account age, and time-of-day.
+- **Approval Workflow:** Built-in HTTP server to intercept high-risk operations and hold them pending a human token approval.
+- **Audit Logging:** Every operation—blocked, simulated, or executed—is durably logged to SQLite with context.
+- **Soft Delete Pattern:** New `archive_customer` logic replaces destructive deletes with a safer 14-day expiry window.
+- **Dry-Run & Read-Only Modes:** Global toggles to safely test agent prompts without touching production Stripe data.
 
 ## Quick start
 
-1. Install
-
+1. **Install globally:**
    ```bash
    npm install -g stripe-mcp
    ```
 
-2. Set your Stripe secret key
-
+2. **Configure environment:**
+   Create a `.env` file with your Stripe secret key and custom thresholds (see `Configuration`).
    ```bash
-   export STRIPE_API_KEY=sk_test_...
+   export STRIPE_API_KEY="sk_test_..."
+   export STRIPE_DRY_RUN=true
    ```
 
-3. Add to your MCP client config (see below) and restart
+3. **Add to your MCP client (e.g. Claude Desktop):**
+   ```json
+   {
+     "mcpServers": {
+       "stripe": {
+         "command": "stripe-mcp",
+         "env": {
+           "STRIPE_API_KEY": "sk_test_..."
+         }
+       }
+     }
+   }
+   ```
 
-## MCP configuration
+## Configuration
 
-### Claude Desktop
+All configuration is handled via environment variables.
 
-`~/.config/claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+### Core credentials
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `STRIPE_API_KEY` | `""` | **[Required]** Your Stripe Secret Key. |
 
-```json
-{
-  "mcpServers": {
-    "stripe": {
-      "command": "stripe-mcp",
-      "env": {
-        "STRIPE_API_KEY": "sk_test_..."
-      }
-    }
-  }
-}
+### Operating modes
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `STRIPE_READ_ONLY` | `false` | Blocks all mutating operations. |
+| `STRIPE_DRY_RUN` | `false` | Runs the middleware pipeline but simulates Stripe execution. |
+| `STRIPE_MCP_DATA_DIR` | `./data` | Path to store SQLite databases. |
+
+### Risk policy thresholds
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `RISK_BLOCK_THRESHOLD` | `70` | Score required to auto-block an operation. |
+| `RISK_FLAG_THRESHOLD` | `40` | Score required to flag an operation for approval. |
+| `RISK_VELOCITY_24H_MAX`| `5` | Customer mutation limit in 24 hours. |
+| `RISK_VELOCITY_30D_MAX`| `20` | Customer mutation limit in 30 days. |
+| `RISK_AMOUNT_HIGH` | `50000` | High amount threshold (in cents). |
+| `RISK_AMOUNT_CRITICAL` | `200000` | Critical amount threshold (in cents). |
+
+### Approval system
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `APPROVAL_PORT` | `3001` | Port for the human review HTTP server (0 to disable). |
+| `APPROVAL_EXPIRY_MINUTES` | `60` | Lifecycle duration of an approval token. |
+| `APPROVAL_REFUND_THRESHOLD`| `100000` | Minimum refund amount requiring approval (in cents). |
+| `APPROVAL_CANCEL_THRESHOLD`| `500000` | Minimum cancellation MRR requiring approval (in cents). |
+
+## Approval Workflow
+
+Operations flagged by the Risk Engine or exceeding hard thresholds are intercepted by the middleware. The agent receives a `policy_error` containing a unique UUID token, and the operation is paused.
+
+A human reviewer can inspect and approve or reject the action via the lightweight HTTP server running on port `3001` (by default).
+
+**Endpoints:**
+- `GET /approvals/{token}` - View the token status and raw parameters.
+- `POST /approvals/{token}/approve` - Approve the operation.
+- `POST /approvals/{token}/reject` - Reject the operation.
+
+**Example:**
+```bash
+# Check status
+curl http://localhost:3001/approvals/123e4567-e89b-12d3-a456-426614174000
+
+# Approve
+curl -X POST http://localhost:3001/approvals/123e4567-e89b-12d3-a456-426614174000/approve
 ```
+*Note: The AI agent must re-attempt the operation after it is approved.*
 
-### Cursor
+## Risk Scoring
 
-`.cursor/mcp.json` in your project root:
+The Risk Engine evaluates every mutation asynchronously. Outcomes fall into three tiers:
+- **Allow (0-39)**
+- **Flag (40-69):** Requires human approval.
+- **Block (70+):** Denied entirely.
 
-```json
-{
-  "mcpServers": {
-    "stripe": {
-      "command": "stripe-mcp",
-      "env": {
-        "STRIPE_API_KEY": "sk_test_..."
-      }
-    }
-  }
-}
-```
+| Factor | Trigger | Points |
+| :--- | :--- | :--- |
+| `very_high_amount` | Amount > `RISK_AMOUNT_CRITICAL` | +35 |
+| `high_amount` | Amount > `RISK_AMOUNT_HIGH` | +20 |
+| `off_hours` | Occurs between 00:00 and 06:00 UTC | +5 |
+| `full_refund` | Refund with no partial amount specified | +5 |
+| `no_reason` | Refund without a reason string | +5 |
+| `velocity_24h` | Customer mutations in last 24h >= `RISK_VELOCITY_24H_MAX` | +15 |
+| `velocity_30d` | Customer mutations in last 30d >= `RISK_VELOCITY_30D_MAX` | +10 |
+| `new_account` | Customer account age < 7 days | +10 |
+| `archived_customer`| Customer has metadata `archived="true"` | +15 |
+| `high_refund_ratio`| Customer historical refund ratio > 30% | +15 |
 
-### Generic MCP client (npx)
+## Operating Modes
 
-```json
-{
-  "mcpServers": {
-    "stripe": {
-      "command": "npx",
-      "args": ["-y", "stripe-mcp"],
-      "env": {
-        "STRIPE_API_KEY": "sk_test_..."
-      }
-    }
-  }
-}
-```
+**Dry-Run Mode (`STRIPE_DRY_RUN=true`)**
+The middleware processes the operation, evaluates risk, checks approval gates, and writes to the SQLite audit log. It then simulates a successful return payload without ever making a network call to the Stripe API. Ideal for testing AI agent prompting.
 
-## Available tools
+**Read-Only Mode (`STRIPE_READ_ONLY=true`)**
+Instantly blocks any operation categorized as a mutation (create, update, delete, refund, pay, confirm) before the payload is even parsed. Useful for safe, exploratory read-access to production environments.
 
-### **Customers**
+**Live Mode (Default)**
+Mutations are evaluated by the Risk Engine and executed against the Stripe API. Always test with a Stripe Restricted Key.
 
-| Tool | Description | Required params |
-|------|-------------|-----------------|
-| `create_customer` | Create a new customer | — |
-| `retrieve_customer` | Get a customer by ID | `customer_id` |
-| `update_customer` | Update customer fields | `customer_id` |
-| `delete_customer` | Permanently delete a customer | `customer_id` |
-| `list_customers` | List customers with optional email filter | — |
+## Available Tools
 
-### **Payments**
+All 28 tools are exposed dynamically via the MCP protocol.
 
-| Tool | Description | Required params |
-|------|-------------|-----------------|
-| `create_payment_intent` | Create a payment intent | `amount`, `currency` |
-| `retrieve_payment_intent` | Get a payment intent by ID | `payment_intent_id` |
-| `confirm_payment_intent` | Confirm to initiate collection | `payment_intent_id` |
-| `cancel_payment_intent` | Cancel a payment intent | `payment_intent_id` |
-| `list_payment_intents` | List with optional customer filter | — |
-
-### **Subscriptions**
-
-| Tool | Description | Required params |
-|------|-------------|-----------------|
-| `create_subscription` | Subscribe a customer to price(s) | `customer`, `items` |
-| `retrieve_subscription` | Get a subscription by ID | `subscription_id` |
-| `update_subscription` | Modify items, billing, or metadata | `subscription_id` |
-| `cancel_subscription` | Cancel immediately or at period end | `subscription_id` |
-| `list_subscriptions` | List with customer/status/price filters | — |
-
-### **Products & Prices**
-
-| Tool | Description | Required params |
-|------|-------------|-----------------|
-| `create_product` | Create a catalog product | `name` |
-| `list_products` | List with active/inactive filter | — |
-| `create_price` | Create a recurring or one-time price | `unit_amount`, `currency`, `product` |
-| `list_prices` | List with product/active/type filters | — |
-
-### **Invoices**
-
-| Tool | Description | Required params |
-|------|-------------|-----------------|
-| `retrieve_invoice` | Get an invoice with line items | `invoice_id` |
-| `list_invoices` | List with customer/status filters | — |
-| `pay_invoice` | Collect payment on an open invoice | `invoice_id` |
-
-### **Balance**
-
-| Tool | Description | Required params |
-|------|-------------|-----------------|
-| `retrieve_balance` | Get account balance by currency | — |
-
-### **Refunds**
-
-| Tool | Description | Required params |
-|------|-------------|-----------------|
-| `create_refund` | Full or partial refund | `payment_intent` or `charge` |
-| `list_refunds` | List with charge/payment intent filter | — |
-
-## Environment variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `STRIPE_API_KEY` | **Yes** | Stripe secret key (`sk_test_...` or `sk_live_...`) |
-| `STRIPE_API_VERSION` | No | Pin a specific API version (default: `2025-02-24.acacia`) |
-| `STRIPE_DEFAULT_LIMIT` | No | Default list page size, 1–100 (default: `10`) |
-| `LOG_LEVEL` | No | `debug` \| `info` \| `warn` \| `error` (default: `info`) |
+| Group | Tools |
+| :--- | :--- |
+| **Customers** | `create_customer`, `retrieve_customer`, `update_customer`, `delete_customer`, `list_customers`, `archive_customer`, `purge_expired_customers` |
+| **Payments** | `create_payment_intent`, `retrieve_payment_intent`, `confirm_payment_intent`, `cancel_payment_intent`, `list_payment_intents` |
+| **Subscriptions** | `create_subscription`, `retrieve_subscription`, `update_subscription`, `cancel_subscription`, `list_subscriptions` |
+| **Products** | `create_product`, `list_products`, `create_price`, `list_prices` |
+| **Invoices** | `retrieve_invoice`, `list_invoices`, `pay_invoice` |
+| **Balance** | `retrieve_balance` |
+| **Refunds** | `create_refund`, `list_refunds` |
+| **Audit** | `get_audit_log` |
 
 ## Development
 
 ```bash
-git clone https://github.com/your-username/stripe-mcp.git
-cd stripe-mcp
 npm install
 npm run build
+npm run lint
+npm run dev
 ```
-
-Run locally:
-
-```bash
-STRIPE_API_KEY=sk_test_... npm run dev
-```
-
-| Script | What it does |
-|--------|-------------|
-| `npm run build` | Compile TypeScript to `dist/` |
-| `npm run dev` | Run with `tsx watch` (auto-reload) |
-| `npm start` | Run compiled `dist/index.js` |
-| `npm run lint` | Lint with ESLint |
 
 ## Contributing
-
-Fork the repo, create a feature branch (`feat/add-checkout-tools`), and open a PR against `main`. Include tests for new tools and ensure `npm run build && npm run lint` passes cleanly. Keep PRs focused — one tool domain per PR.
+Pull requests are welcome for new capabilities and Stripe endpoints. Please ensure all modifications pass the strict TypeScript compiler checks. All new mutating tools must route through the `executeStripeOperation` middleware.
 
 ## License
-
 MIT

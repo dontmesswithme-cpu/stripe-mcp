@@ -8,7 +8,7 @@
  * - Validates required environment variables at startup.
  * - Initializes SQLite databases for audit logging and approvals.
  * - Starts the approval HTTP server (configurable port).
- * - Registers 29 MCP tools across 9 domains.
+ * - Registers 28 MCP tools across 8 domains.
  * - Connects via stdio transport (stdout is reserved for MCP protocol;
  *   all diagnostic output is written to stderr).
  * - Handles SIGINT / SIGTERM for graceful shutdown.
@@ -24,7 +24,8 @@ import { dirname, resolve } from "node:path";
 import "./stripe-client.js";
 
 // ── Infrastructure ──────────────────────────────────────────────────
-import { closeAllDatabases } from "./utils/db.js";
+import { config } from "./config.js";
+import { getDb, closeAllDatabases } from "./utils/db.js";
 import { startApprovalServer } from "./approval/server.js";
 
 // ── Tool handlers ───────────────────────────────────────────────────
@@ -72,7 +73,7 @@ import { retrieveBalance } from "./tools/balance.js";
 
 import { createRefund, listRefunds } from "./tools/refunds.js";
 
-import { getAuditLog, getApprovalStatus } from "./tools/audit.js";
+import { getAuditLog } from "./tools/audit.js";
 
 // ── Zod schemas (for server.tool() registration) ────────────────────
 
@@ -114,14 +115,12 @@ import {
   // Balance
   RetrieveBalanceSchema,
 
-  // Refunds — use the base ZodObject (not the refined ZodEffects)
-  // so .shape is accessible. The handler validates the XOR constraint.
+  // Refunds
   CreateRefundFields,
   ListRefundsSchema,
 
   // Admin
   GetAuditLogSchema,
-  GetApprovalStatusSchema,
 } from "./types.js";
 
 import type { McpToolResponse } from "./types.js";
@@ -175,6 +174,11 @@ async function main(): Promise<void> {
     name: "stripe-mcp",
     version: pkg.version,
   });
+
+  // ── Open databases ────────────────────────────────────────────────
+  // This explicitly initializes the SQLite databases on startup as requested
+  getDb("audit");
+  getDb("approvals");
 
   // ── Start approval HTTP server ──────────────────────────────────
   startApprovalServer();
@@ -397,7 +401,7 @@ async function main(): Promise<void> {
   );
 
   // ────────────────────────────────────────────────────────────────
-  // § Admin Tools (2)
+  // § Audit Tools (1)
   // ────────────────────────────────────────────────────────────────
 
   server.tool(
@@ -405,13 +409,6 @@ async function main(): Promise<void> {
     "Query the operation audit log. Filter by customer, tool, operation type, outcome, or date range.",
     GetAuditLogSchema.shape,
     async (args) => formatResponse(await getAuditLog(args)),
-  );
-
-  server.tool(
-    "get_approval_status",
-    "Check the status of an approval token (pending, approved, rejected, expired).",
-    GetApprovalStatusSchema.shape,
-    async (args) => formatResponse(await getApprovalStatus(args)),
   );
 
   // ── Transport & Lifecycle ──────────────────────────────────────
@@ -438,9 +435,33 @@ async function main(): Promise<void> {
 
   await server.connect(transport);
 
-  console.error(
-    `stripe-mcp v${pkg.version} ready — 29 tools registered, listening on stdio`,
-  );
+  // ── Startup Log ─────────────────────────────────────────────────
+
+  console.error("==================================================");
+  console.error(`🚀 stripe-mcp v${pkg.version} initialized`);
+  console.error("==================================================");
+  
+  if (config.dryRun) {
+    console.error("⚠️  MODE: DRY-RUN (Mutations simulated, no API calls)");
+  } else if (config.readOnly) {
+    console.error("⚠️  MODE: READ-ONLY (Mutations completely blocked)");
+  } else {
+    console.error("✅ MODE: LIVE (Mutations active)");
+  }
+
+  if (config.approvalPort > 0) {
+    console.error(`✅ APPROVALS: HTTP Server listening on port ${config.approvalPort}`);
+  } else {
+    console.error("⚠️  APPROVALS: Server disabled (APPROVAL_PORT=0)");
+  }
+
+  console.error("🛡️  RISK THRESHOLDS:");
+  console.error(`   - Block:   ${config.riskBlockThreshold}+ points`);
+  console.error(`   - Flag:    ${config.riskFlagThreshold}-${config.riskBlockThreshold - 1} points`);
+  console.error(`   - High $$: ${config.riskAmountHigh} (adds 20 pts)`);
+  console.error(`   - Crit $$: ${config.riskAmountCritical} (adds 35 pts)`);
+  console.error("==================================================");
+  console.error("Ready — 28 tools registered, listening on stdio.");
 }
 
 // ── Top-level entry ─────────────────────────────────────────────────
