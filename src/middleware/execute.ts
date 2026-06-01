@@ -69,8 +69,19 @@ export async function executeStripeOperation<T>(
     };
   }
 
-  // ── Idempotency Generation ──────────────────────────────────────
-  const idempotencyKey = context.params.idempotency_key ?? randomUUID();
+  // ── 2. Idempotency Enforcement ──────────────────────────────────
+  const idempotencyKey = context.params.idempotency_key as string | undefined;
+  
+  if (!idempotencyKey) {
+    return {
+      success: false,
+      error: {
+        code: "missing_idempotency_key",
+        type: "invalid_request_error",
+        message: "CRITICAL: All mutating operations require a client-generated 'idempotency_key' UUID to prevent duplicate financial transactions during network retries.",
+      },
+    };
+  }
 
   // ── Approval Token Consumption ──────────────────────────────────
   let riskResult: RiskScore | null = null;

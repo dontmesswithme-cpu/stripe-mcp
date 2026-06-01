@@ -330,14 +330,29 @@ export async function purgeExpiredCustomers(
       const deleted: string[] = [];
       const errors: { id: string; error: string }[] = [];
       
-      for (const id of expiredIds) {
-        try {
-          await stripe.customers.del(id, options);
-          deleted.push(id);
-        } catch (error: any) {
-          errors.push({ id, error: error.message || "Unknown error" });
+      // Native bounded concurrency (rolling window)
+      const CONCURRENCY_LIMIT = 15; 
+      let index = 0;
+
+      const worker = async () => {
+        while (index < expiredIds.length) {
+          const id = expiredIds[index++];
+          try {
+            await stripe.customers.del(id, options);
+            deleted.push(id);
+          } catch (error: any) {
+            errors.push({ id, error: error.message || "Unknown error" });
+          }
         }
-      }
+      };
+
+      // Spawn workers up to the concurrency limit
+      const workers = Array.from(
+        { length: Math.min(CONCURRENCY_LIMIT, expiredIds.length) }, 
+        () => worker()
+      );
+      
+      await Promise.all(workers);
 
       return { 
         dry_run: false, 

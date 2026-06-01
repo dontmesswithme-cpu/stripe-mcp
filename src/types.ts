@@ -209,8 +209,7 @@ export const BaseMutationSchema = z.object({
     .describe("Provide the UUID token here if executing a pre-approved operation."),
   idempotency_key: z
     .string()
-    .optional()
-    .describe("UUID to prevent duplicate execution on retries. Strongly recommended."),
+    .describe("REQUIRED: Generate a UUID to prevent duplicate execution on retries."),
 });
 
 /**
