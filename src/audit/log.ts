@@ -48,22 +48,26 @@ export function writeAuditEntry(
   riskScore: number | null,
   metadata: Record<string, unknown>,
 ): void {
-  const db = getAuditDb();
+  try {
+    const db = getAuditDb();
 
-  db.prepare(
-    `INSERT INTO audit_log
-       (tool_name, customer_id, operation_type, amount, currency, outcome, risk_score, metadata)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    context.capability.tool,
-    context.customerId ?? null,
-    context.capability.operation,
-    context.amount ?? null,
-    context.currency ?? null,
-    outcome,
-    riskScore,
-    JSON.stringify(metadata),
-  );
+    db.prepare(
+      `INSERT INTO audit_log
+         (tool_name, customer_id, operation_type, amount, currency, outcome, risk_score, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      context.capability.tool,
+      context.customerId ?? null,
+      context.capability.operation,
+      context.amount ?? null,
+      context.currency ?? null,
+      outcome,
+      riskScore,
+      JSON.stringify(metadata),
+    );
+  } catch (error) {
+    console.error(`stripe-mcp CRITICAL: Failed to write audit log.`, error);
+  }
 }
 
 // ── Read ────────────────────────────────────────────────────────────

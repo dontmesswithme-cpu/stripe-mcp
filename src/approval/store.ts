@@ -2,16 +2,9 @@
  * @module approval/store
  *
  * SQLite-backed approval token CRUD.
- *
- * Tokens are created when a high-risk or high-value operation requires
- * human approval before execution. Tokens expire after a configurable
- * duration (default 60 minutes).
- *
- * The approval HTTP server ({@link ../approval/server}) and the
- * `get_approval_status` MCP tool both read from this store.
  */
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { getApprovalsDb } from "../utils/db.js";
 import { config } from "../config.js";
 import type {
@@ -23,6 +16,7 @@ import type {
 
 interface RawApprovalRow {
   readonly token: string;
+  readonly request_hash: string;
   readonly tool: string;
   readonly operation: string;
   readonly status: string;
@@ -33,23 +27,62 @@ interface RawApprovalRow {
   readonly params: string;
   readonly decided_at: string | null;
   readonly decided_by: string | null;
+  readonly consumed_at: string | null;
 }
+
+export type ConsumeApprovalFailure =
+  | "not_found"
+  | "not_approved"
+  | "expired"
+  | "hash_mismatch"
+  | "already_consumed";
+
+export type ConsumeApprovalResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: ConsumeApprovalFailure };
 
 // ── Public API ──────────────────────────────────────────────────────
 
-/**
- * Create a new pending approval token for an operation.
- *
- * @param context - The operation context (tool, params, etc.).
- * @param riskScore - The risk score at the time of creation.
- * @returns The newly created {@link ApprovalToken}.
- */
+export function canonicalize(obj: unknown): unknown {
+  if (obj === null || typeof obj !== "object") {
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(canonicalize);
+  }
+  const keys = Object.keys(obj as Record<string, unknown>).sort();
+  const result: Record<string, unknown> = {};
+  for (const key of keys) {
+    const value = (obj as Record<string, unknown>)[key];
+    if (key === "approval_token" || value === undefined) continue;
+    result[key] = canonicalize(value);
+  }
+  return result;
+}
+
+export function computeRequestHash(context: OperationContext): string {
+  const { capability, params } = context;
+  const canonicalParams = canonicalize(params);
+  const idempotencyKey = String(params.idempotency_key ?? "");
+
+  return createHash("sha256")
+    .update(capability.tool)
+    .update("|")
+    .update(capability.operation)
+    .update("|")
+    .update(idempotencyKey)
+    .update("|")
+    .update(JSON.stringify(canonicalParams))
+    .digest("hex");
+}
+
 export function createApproval(
   context: OperationContext,
   riskScore: number,
 ): ApprovalToken {
   const db = getApprovalsDb();
   const token = randomUUID();
+  const requestHash = computeRequestHash(context);
   const now = new Date();
   const expiresAt = new Date(
     now.getTime() + config.approvalExpiryMinutes * 60_000,
@@ -57,10 +90,11 @@ export function createApproval(
 
   db.prepare(
     `INSERT INTO approvals
-       (token, tool, operation, status, created_at, expires_at, requested_by, risk_score, params)
-     VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+       (token, request_hash, tool, operation, status, created_at, expires_at, requested_by, risk_score, params)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
   ).run(
     token,
+    requestHash,
     context.capability.tool,
     context.capability.operation,
     now.toISOString(),
@@ -69,9 +103,9 @@ export function createApproval(
     riskScore,
     JSON.stringify(context.params),
   );
-
   return {
     token,
+    requestHash,
     tool: context.capability.tool,
     operation: context.capability.operation,
     status: "pending",
@@ -80,19 +114,12 @@ export function createApproval(
     requestedBy: "mcp-agent",
     riskScore,
     params: context.params,
+    consumedAt: null,
   };
 }
 
-/**
- * Retrieve an approval token by its UUID.
- *
- * @description Automatically expires any stale pending tokens before
- *   returning the result.
- * @param token - The UUID token string.
- * @returns The {@link ApprovalToken} if found, or `null`.
- */
 export function getApproval(token: string): ApprovalToken | null {
-  expirePending();
+  expireStaleApprovals();
   const db = getApprovalsDb();
   const row = db
     .prepare("SELECT * FROM approvals WHERE token = ?")
@@ -102,18 +129,11 @@ export function getApproval(token: string): ApprovalToken | null {
   return parseApprovalRow(row);
 }
 
-/**
- * Approve a pending token.
- *
- * @param token - The UUID token to approve.
- * @param decidedBy - Who approved (default: "admin").
- * @returns The updated {@link ApprovalToken}, or `null` if not found/not pending.
- */
 export function approveToken(
   token: string,
   decidedBy: string = "admin",
 ): ApprovalToken | null {
-  expirePending();
+  expireStaleApprovals();
   const db = getApprovalsDb();
   const result = db
     .prepare(
@@ -127,23 +147,16 @@ export function approveToken(
   return getApproval(token);
 }
 
-/**
- * Reject a pending token.
- *
- * @param token - The UUID token to reject.
- * @param decidedBy - Who rejected (default: "admin").
- * @returns The updated {@link ApprovalToken}, or `null` if not found/not pending.
- */
 export function rejectToken(
   token: string,
   decidedBy: string = "admin",
 ): ApprovalToken | null {
-  expirePending();
+  expireStaleApprovals();
   const db = getApprovalsDb();
   const result = db
     .prepare(
       `UPDATE approvals
-       SET status = 'rejected', decided_at = ?, decided_by = ?
+       SET status = 'expired', decided_at = ?, decided_by = ?
        WHERE token = ? AND status = 'pending'`,
     )
     .run(new Date().toISOString(), decidedBy, token);
@@ -152,36 +165,79 @@ export function rejectToken(
   return getApproval(token);
 }
 
-// ── Internal ────────────────────────────────────────────────────────
+export function consumeApprovalInTransaction(
+  token: string,
+  requestHash: string,
+  db: ReturnType<typeof getApprovalsDb>,
+): ConsumeApprovalResult {
+  const row = db
+    .prepare("SELECT status, request_hash, expires_at FROM approvals WHERE token = ?")
+    .get(token) as
+    | { status: string; request_hash: string; expires_at: string }
+    | undefined;
 
-/**
- * Expire all pending tokens whose `expires_at` is in the past.
- * Called automatically before every read/write.
- */
-function expirePending(): void {
+  if (!row) {
+    return { ok: false, reason: "not_found" };
+  }
+
+  if (row.status === "consumed") {
+    return { ok: false, reason: "already_consumed" };
+  }
+
+  if (row.status === "expired") {
+    return { ok: false, reason: "expired" };
+  }
+
+  if (row.status !== "approved") {
+    return { ok: false, reason: "not_approved" };
+  }
+
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    db.prepare(
+      `UPDATE approvals SET status = 'expired' WHERE token = ? AND status = 'approved'`,
+    ).run(token);
+    return { ok: false, reason: "expired" };
+  }
+
+  if (row.request_hash !== requestHash) {
+    return { ok: false, reason: "hash_mismatch" };
+  }
+
+  const result = db.prepare(
+    `UPDATE approvals SET status = 'consumed', consumed_at = ?
+     WHERE token = ? AND status = 'approved' AND request_hash = ?`,
+  ).run(new Date().toISOString(), token, requestHash);
+
+  if (result.changes === 0) {
+    return { ok: false, reason: "already_consumed" };
+  }
+
+  return { ok: true };
+}
+
+/** Atomically consumes an approved token (standalone; prefer {@link beginExecution}). */
+export function consumeApproval(
+  token: string,
+  requestHash: string,
+): ConsumeApprovalResult {
+  return consumeApprovalInTransaction(token, requestHash, getApprovalsDb());
+}
+
+function expireStaleApprovals(): void {
   const db = getApprovalsDb();
+  const now = new Date().toISOString();
   db.prepare(
     "UPDATE approvals SET status = 'expired' WHERE status = 'pending' AND expires_at < ?",
-  ).run(new Date().toISOString());
+  ).run(now);
+  db.prepare(
+    "UPDATE approvals SET status = 'expired' WHERE status = 'approved' AND expires_at < ?",
+  ).run(now);
 }
 
-/**
- * Marks an approved token as 'consumed' so it cannot be re-used.
- * Only succeeds if the token is currently 'approved'.
- */
-export function consumeApproval(token: string): boolean {
-  const db = getApprovalsDb();
-  const stmt = db.prepare(
-    `UPDATE approvals SET status = 'consumed' WHERE token = ? AND status = 'approved'`,
-  );
-  const info = stmt.run(token);
-  return info.changes > 0;
-}
-
-/** Convert a raw SQLite row to a typed {@link ApprovalToken}. */
 function parseApprovalRow(row: RawApprovalRow): ApprovalToken {
   return {
     token: row.token,
+    requestHash: row.request_hash,
     tool: row.tool,
     operation: row.operation as ApprovalToken["operation"],
     status: row.status as ApprovalToken["status"],
@@ -190,5 +246,6 @@ function parseApprovalRow(row: RawApprovalRow): ApprovalToken {
     requestedBy: row.requested_by,
     riskScore: row.risk_score,
     params: JSON.parse(row.params) as Record<string, unknown>,
+    consumedAt: row.consumed_at,
   };
 }

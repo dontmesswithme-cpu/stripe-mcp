@@ -59,6 +59,16 @@ export interface StripeMcpConfig {
 
   // ── Archive
   readonly archiveDeleteAfterDays: number;
+
+  // ── Execution / reconciliation
+  readonly executionStaleMinutes: number;
+  readonly reconciliationIntervalMs: number;
+  readonly reconciliationRetryIntervalMs: number;
+  readonly reconciliationMaxAgeHours: number;
+
+  // ── Stripe write throttling (background jobs)
+  readonly stripeWriteConcurrency: number;
+  readonly stripeWriteIntervalMs: number;
 }
 
 // ── Singleton config instance ───────────────────────────────────────
@@ -74,7 +84,7 @@ export const config: StripeMcpConfig = Object.freeze({
   dataDir: envStr("STRIPE_MCP_DATA_DIR", "./data"),
 
   // Approval server
-  approvalApiKey: envStr("APPROVAL_API_KEY", "dev_key_change_in_production"),
+  approvalApiKey: envStr("APPROVAL_API_KEY", ""),
   approvalPort: envInt("APPROVAL_PORT", 3001),
   approvalExpiryMinutes: envInt("APPROVAL_EXPIRY_MINUTES", 60),
   approvalRefundThreshold: envInt("APPROVAL_REFUND_THRESHOLD", 100_000),
@@ -90,4 +100,12 @@ export const config: StripeMcpConfig = Object.freeze({
 
   // Archive
   archiveDeleteAfterDays: envInt("ARCHIVE_DELETE_AFTER_DAYS", 14),
+
+  // Execution / reconciliation
+  executionStaleMinutes: envInt("EXECUTION_STALE_MINUTES", 5),
+  reconciliationIntervalMs: envInt("RECONCILIATION_INTERVAL_MS", 60_000),
+  reconciliationRetryIntervalMs: envInt("RECONCILIATION_RETRY_INTERVAL_MS", 900_000),
+  reconciliationMaxAgeHours: envInt("RECONCILIATION_MAX_AGE_HOURS", 24),
+  stripeWriteConcurrency: envInt("STRIPE_WRITE_CONCURRENCY", 3),
+  stripeWriteIntervalMs: envInt("STRIPE_WRITE_INTERVAL_MS", 150),
 });

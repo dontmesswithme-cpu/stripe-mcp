@@ -12,6 +12,7 @@ import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
 import { executeStripeOperation } from "../middleware/execute.js";
+import { resolveSubscriptionValueCents } from "../utils/stripe-amounts.js";
 import type {
   CancelSubscriptionInput,
   CreateSubscriptionInput,
@@ -204,11 +205,20 @@ const cancelSubscriptionCapability: ToolCapability = {
 export async function cancelSubscription(
   input: CancelSubscriptionInput,
 ): Promise<McpToolResponse<Stripe.Subscription>> {
+  let subscriptionValue: number;
+  try {
+    subscriptionValue = await resolveSubscriptionValueCents(
+      input.subscription_id,
+    );
+  } catch (error: unknown) {
+    return toErrorResponse(error);
+  }
+
   return executeStripeOperation(
     {
       capability: cancelSubscriptionCapability,
       customerId: undefined,
-      amount: undefined,
+      amount: subscriptionValue,
       currency: undefined,
       params: input as Record<string, unknown>,
     },

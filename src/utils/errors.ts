@@ -122,3 +122,21 @@ export function toErrorResponse(error: unknown): McpToolResponse<never> {
 function fail(error: ToolError): McpToolResponse<never> {
   return { success: false, error } as const;
 }
+
+/** Stripe errors that will not change outcome on idempotent retry. */
+export function isStripeTerminalError(error: unknown): boolean {
+  return (
+    error instanceof Stripe.errors.StripeInvalidRequestError ||
+    error instanceof Stripe.errors.StripeAuthenticationError ||
+    error instanceof Stripe.errors.StripeCardError
+  );
+}
+
+export function toolErrorFromResponse(
+  response: McpToolResponse<unknown>,
+): ToolError | null {
+  if (!response.success) {
+    return response.error;
+  }
+  return null;
+}

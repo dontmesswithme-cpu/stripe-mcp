@@ -25,8 +25,13 @@ import "./stripe-client.js";
 
 // ── Infrastructure ──────────────────────────────────────────────────
 import { config } from "./config.js";
-import { getAuditDb, getApprovalsDb, closeAllDatabases } from "./utils/db.js";
-import { startApprovalServer } from "./approval/server.js";
+import { closeAllDatabases } from "./utils/db.js";
+import { startApprovalServer, stopApprovalServer } from "./approval/server.js";
+import {
+  startReconciliationLoop,
+  stopReconciliationLoop,
+} from "./reconciliation/scheduler.js";
+import { initializeAllDatabases } from "./utils/db.js";
 
 // ── Tool handlers ───────────────────────────────────────────────────
 
@@ -175,13 +180,14 @@ async function main(): Promise<void> {
     version: pkg.version,
   });
 
-  // ── Open databases ────────────────────────────────────────────────
-  // This explicitly initializes the SQLite databases on startup as requested
-  getAuditDb();
-  getApprovalsDb();
+  // ── Migrate databases (exclusive lock — safe for multi-process startup) ─
+  initializeAllDatabases();
 
   // ── Start approval HTTP server ──────────────────────────────────
   startApprovalServer();
+
+  // ── Reconciliation loop (single-flight, idempotent replay) ───────
+  startReconciliationLoop();
 
   // ────────────────────────────────────────────────────────────────
   // § Customer Tools (7)
@@ -421,10 +427,16 @@ async function main(): Promise<void> {
    */
   const shutdown = async (signal: string): Promise<void> => {
     console.error(`\nstripe-mcp: received ${signal}, shutting down…`);
+    stopReconciliationLoop();
     try {
       await server.close();
     } catch {
       // Best-effort — transport may already be closed.
+    }
+    try {
+      await stopApprovalServer();
+    } catch {
+      // Best-effort.
     }
     closeAllDatabases();
     process.exit(0);
@@ -449,10 +461,10 @@ async function main(): Promise<void> {
     console.error("✅ MODE: LIVE (Mutations active)");
   }
 
-  if (config.approvalPort > 0) {
-    console.error(`✅ APPROVALS: HTTP Server listening on port ${config.approvalPort}`);
+  if (config.approvalPort > 0 && config.approvalApiKey) {
+    console.error(`✅ APPROVALS: HTTP Server listening on http://127.0.0.1:${config.approvalPort}`);
   } else {
-    console.error("⚠️  APPROVALS: Server disabled (APPROVAL_PORT=0)");
+    console.error("⚠️  APPROVALS: Server disabled (APPROVAL_PORT=0 or APPROVAL_API_KEY missing)");
   }
 
   console.error("🛡️  RISK THRESHOLDS:");

@@ -13,6 +13,8 @@ import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
 import { executeStripeOperation } from "../middleware/execute.js";
 import { config } from "../config.js";
+import { deriveIdempotencyKey } from "../utils/idempotency.js";
+import { forEachStripeWrite } from "../utils/stripe-throttle.js";
 import type {
   ArchiveCustomerInput,
   CreateCustomerInput,
@@ -254,18 +256,30 @@ export async function archiveCustomer(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    (options) => {
+    async (options) => {
+      const existing = await stripe.customers.retrieve(input.customer_id);
+      if ("deleted" in existing && existing.deleted) {
+        throw new Error(`Customer ${input.customer_id} is already deleted`);
+      }
+
       const deleteAfter = new Date(
         Date.now() + config.archiveDeleteAfterDays * 24 * 60 * 60 * 1000,
       ).toISOString();
 
-      return stripe.customers.update(input.customer_id, {
-        metadata: {
-          archived: "true",
-          archived_at: new Date().toISOString(),
-          delete_after: deleteAfter,
+      const customer = existing as Stripe.Customer;
+
+      return stripe.customers.update(
+        input.customer_id,
+        {
+          metadata: {
+            ...customer.metadata,
+            archived: "true",
+            archived_at: new Date().toISOString(),
+            delete_after: deleteAfter,
+          },
         },
-      }, options);
+        options,
+      );
     },
   );
 }
@@ -306,12 +320,13 @@ export async function purgeExpiredCustomers(
       currency: undefined,
       params: input as Record<string, unknown>,
     },
-    async (options) => {
+    async ({ idempotencyKey }) => {
       const now = new Date();
       const expiredIds: string[] = [];
-      
-      // Auto-paginate through all results
-      for await (const customer of stripe.customers.search({ query: 'metadata["archived"]:"true"' }, options)) {
+
+      for await (const customer of stripe.customers.search({
+        query: 'metadata["archived"]:"true"',
+      })) {
         const deleteAfter = customer.metadata?.delete_after;
         if (deleteAfter && new Date(deleteAfter) <= now) {
           expiredIds.push(customer.id);
@@ -329,30 +344,26 @@ export async function purgeExpiredCustomers(
 
       const deleted: string[] = [];
       const errors: { id: string; error: string }[] = [];
-      
-      // Native bounded concurrency (rolling window)
-      const CONCURRENCY_LIMIT = 15; 
-      let index = 0;
 
-      const worker = async () => {
-        while (index < expiredIds.length) {
-          const id = expiredIds[index++];
+      await forEachStripeWrite(
+        expiredIds,
+        async (id) => {
           try {
-            await stripe.customers.del(id, options);
+            await stripe.customers.del(id, {
+              idempotencyKey: deriveIdempotencyKey(idempotencyKey, id),
+            });
             deleted.push(id);
-          } catch (error: any) {
-            errors.push({ id, error: error.message || "Unknown error" });
+          } catch (error: unknown) {
+            const message =
+              error instanceof Error ? error.message : "Unknown error";
+            errors.push({ id, error: message });
           }
-        }
-      };
-
-      // Spawn workers up to the concurrency limit
-      const workers = Array.from(
-        { length: Math.min(CONCURRENCY_LIMIT, expiredIds.length) }, 
-        () => worker()
+        },
+        {
+          concurrency: config.stripeWriteConcurrency,
+          intervalMs: config.stripeWriteIntervalMs,
+        },
       );
-      
-      await Promise.all(workers);
 
       return { 
         dry_run: false, 

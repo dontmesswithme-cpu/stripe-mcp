@@ -124,29 +124,48 @@ export interface RiskScore {
   readonly reasons: readonly string[];
 }
 
-/** Lifecycle status of an approval token. */
-export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
+export type ApprovalStatus = "pending" | "approved" | "consumed" | "expired";
 
-/** Persisted approval token record. */
 export interface ApprovalToken {
-  /** Unique token (UUIDv4). */
   readonly token: string;
-  /** MCP tool name that triggered the approval. */
+  readonly requestHash: string;
   readonly tool: string;
-  /** Operation type. */
   readonly operation: OperationType;
-  /** Current lifecycle status. */
   readonly status: ApprovalStatus;
-  /** ISO 8601 creation timestamp. */
   readonly createdAt: string;
-  /** ISO 8601 expiry timestamp. */
   readonly expiresAt: string;
-  /** Who/what requested this. */
   readonly requestedBy: string;
-  /** Risk score at time of creation. */
   readonly riskScore: number;
-  /** Serialized operation parameters. */
   readonly params: Record<string, unknown>;
+  readonly consumedAt: string | null;
+}
+
+export type ExecutionStatus = "executing" | "unknown_outcome" | "completed" | "failed_terminal" | "cancelled";
+
+export interface ExecutionReconcileContext {
+  readonly tool: string;
+  readonly operation: OperationType;
+  readonly params: Record<string, unknown>;
+}
+
+export interface ExecutionRecord {
+  readonly executionId: string;
+  readonly approvalToken: string | null;
+  readonly requestHash: string;
+  readonly idempotencyKey: string;
+  readonly status: ExecutionStatus;
+  readonly workerHostname: string;
+  readonly workerPid: number;
+  readonly workerUuid: string;
+  readonly startedAt: string;
+  readonly completedAt: string | null;
+  readonly stripeObjectId: string | null;
+  readonly lastError: Record<string, unknown> | null;
+  readonly reconcileTool: string;
+  readonly reconcileOperation: OperationType;
+  readonly reconcileParams: Record<string, unknown>;
+  readonly lastReconcileAt: string | null;
+  readonly reconcileAttempts: number;
 }
 
 /** A single audit log entry. */
@@ -209,7 +228,8 @@ export const BaseMutationSchema = z.object({
     .describe("Provide the UUID token here if executing a pre-approved operation."),
   idempotency_key: z
     .string()
-    .describe("REQUIRED: Generate a UUID to prevent duplicate execution on retries."),
+    .uuid()
+    .describe("REQUIRED: Generate a UUIDv4 to prevent duplicate execution on retries."),
 });
 
 /**

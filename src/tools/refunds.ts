@@ -12,6 +12,7 @@ import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
 import { executeStripeOperation } from "../middleware/execute.js";
+import { resolveRefundAmountCents } from "../utils/stripe-amounts.js";
 import type {
   ToolCapability,
   CreateRefundInput,
@@ -74,11 +75,18 @@ export async function createRefund(
     };
   }
 
+  let refundAmount: number;
+  try {
+    refundAmount = await resolveRefundAmountCents(input);
+  } catch (error: unknown) {
+    return toErrorResponse(error);
+  }
+
   return executeStripeOperation(
     {
       capability: createRefundCapability,
       customerId: undefined,
-      amount: input.amount,
+      amount: refundAmount,
       currency: undefined,
       params: input as Record<string, unknown>,
     },

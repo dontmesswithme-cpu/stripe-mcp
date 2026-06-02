@@ -1,129 +1,108 @@
 /**
  * @module middleware/execute
  *
- * Central execution pipeline for all mutating Stripe operations.
- *
- * Every tool handler that performs a mutation calls
- * {@link executeStripeOperation} instead of calling the Stripe SDK
- * directly. This function enforces:
- *
- * 1. **Read-only mode** — blocks if `STRIPE_READ_ONLY=true`
- * 2. **Dry-run mode** — simulates without executing if `STRIPE_DRY_RUN=true`
- * 3. **Risk scoring** — evaluates risk factors (if `riskScored`)
- * 4. **Approval gate** — generates tokens for high-risk/high-value ops
- * 5. **Execution** — calls the Stripe SDK
- * 6. **Audit logging** — writes every outcome to the audit log
- *
- * Read-only tools (retrieve, list) bypass this middleware entirely.
+ * Core execution pipeline for all Stripe MCP tools.
  */
 
-import { randomUUID } from "node:crypto";
-import type Stripe from "stripe";
 import { config } from "../config.js";
 import { writeAuditEntry } from "../audit/log.js";
 import { scoreRisk } from "../risk/engine.js";
-import { getApproval, createApproval, consumeApproval } from "../approval/store.js";
-import { toErrorResponse } from "../utils/errors.js";
-import type { McpToolResponse, OperationContext, RiskScore } from "../types.js";
+import {
+  getApproval,
+  createApproval,
+  computeRequestHash,
+  type ConsumeApprovalFailure,
+} from "../approval/store.js";
+import { beginExecution, updateExecutionStatus } from "../execution/store.js";
+import { WORKER_ID } from "../worker/identity.js";
+import {
+  isStripeTerminalError,
+  toErrorResponse,
+  toolErrorFromResponse,
+} from "../utils/errors.js";
+import type { McpToolResponse, OperationContext, RiskScore, ToolError } from "../types.js";
 
-// ── Public API ──────────────────────────────────────────────────────
-
-/**
- * Execute a mutating Stripe operation through the full middleware pipeline.
- *
- * @description This is the single gateway for all mutations. It checks
- *   policy (read-only, dry-run), evaluates risk, gates on approval,
- *   executes, and audits — in that order.
- *
- *   The `operation` parameter is a lazy thunk so that the Stripe API
- *   call only executes if all policy checks pass.
- *
- * @typeParam T - The Stripe response type (e.g. `Stripe.Refund`).
- * @param context - Describes what is about to happen (tool, customer, amount, etc.).
- * @param operation - A zero-arg async function that performs the actual Stripe SDK call.
- * @returns A standardized `McpToolResponse` with either `success: true` or `success: false`.
- */
 export async function executeStripeOperation<T>(
   context: OperationContext,
-  operation: (options: Stripe.RequestOptions) => Promise<T>,
+  operation: (params: { idempotencyKey: string }) => Promise<T>,
 ): Promise<McpToolResponse<T>> {
-  // ── 1. Sanity check ─────────────────────────────────────────────
   if (context.capability.readOnly) {
     throw new Error(
       `BUG: read-only tool "${context.capability.tool}" routed through middleware`,
     );
   }
 
-  // ── 2. Read-only mode ───────────────────────────────────────────
+  const idempotencyKey = context.params.idempotency_key as string | undefined;
+
+  if (!idempotencyKey) {
+    return {
+      success: false,
+      error: {
+        code: "missing_idempotency_key",
+        type: "validation_error",
+        message: "Mutating operations require an idempotency_key parameter.",
+      },
+    };
+  }
+
   if (config.readOnly) {
-    writeAuditEntry(context, "blocked", null, { reason: "read_only_mode" });
+    writeAuditEntry(context, "blocked", null, {
+      reason: "read_only_mode",
+      idempotency_key: idempotencyKey,
+    });
     return {
       success: false,
       error: {
         code: "read_only",
         type: "policy_error",
         message:
-          "STRIPE_READ_ONLY is enabled — all mutating operations are blocked. " +
-          "Unset the variable or set it to false to proceed.",
+          "STRIPE_READ_ONLY is enabled — all mutating operations are blocked.",
       },
     };
   }
 
-  // ── 2. Idempotency Enforcement ──────────────────────────────────
-  const idempotencyKey = context.params.idempotency_key as string | undefined;
-  
-  if (!idempotencyKey) {
-    return {
-      success: false,
-      error: {
-        code: "missing_idempotency_key",
-        type: "invalid_request_error",
-        message: "CRITICAL: All mutating operations require a client-generated 'idempotency_key' UUID to prevent duplicate financial transactions during network retries.",
-      },
-    };
-  }
-
-  // ── Approval Token Consumption ──────────────────────────────────
-  let riskResult: RiskScore | null = null;
   let isPreApproved = false;
+  let riskResult: RiskScore | undefined;
 
-  if (context.params.approval_token) {
-    const approval = getApproval(context.params.approval_token);
-    
-    if (!approval || approval.status !== "approved") {
-      return {
-        success: false,
-        error: {
-          code: "invalid_approval",
-          type: "policy_error",
-          message: "Approval token is invalid, expired, or not yet approved.",
-        },
-      };
+  if (context.capability.approvalEligible && context.params.approval_token) {
+    const approval = getApproval(context.params.approval_token as string);
+
+    if (!approval) {
+      return policyError(
+        "invalid_approval_token",
+        "The provided approval token does not exist or has expired.",
+      );
     }
-
-    // Token is valid. Mark as consumed to prevent replay attacks.
-    if (!consumeApproval(approval.token)) {
-      return {
-        success: false,
-        error: {
-          code: "token_already_consumed",
-          type: "policy_error",
-          message: "This approval token has already been consumed.",
-        },
-      };
+    if (approval.status !== "approved") {
+      return policyError(
+        "token_not_approved",
+        `Token is in state '${approval.status}', expected 'approved'.`,
+      );
+    }
+    if (
+      approval.tool !== context.capability.tool ||
+      approval.operation !== context.capability.operation
+    ) {
+      return policyError(
+        "approval_mismatch",
+        "Approval token does not match the requested tool or operation.",
+      );
     }
 
     isPreApproved = true;
   }
 
-  // ── 3. Dry-run mode ─────────────────────────────────────────────
   if (config.dryRun) {
-    // If risk scored, compute it for the audit log
     if (context.capability.riskScored && !isPreApproved) {
       riskResult = await scoreRisk(context);
+      const block = checkRiskBlock(context, riskResult);
+      if (block) return block;
     }
 
-    const metadata: Record<string, unknown> = { dry_run: true, idempotency_key: idempotencyKey };
+    const metadata: Record<string, unknown> = {
+      dry_run: true,
+      idempotency_key: idempotencyKey,
+    };
     if (isPreApproved) {
       metadata.pre_approved_by_token = context.params.approval_token;
     }
@@ -147,58 +126,65 @@ export async function executeStripeOperation<T>(
     };
   }
 
-  // ── 4. Risk scoring ─────────────────────────────────────────────
+  const requestHash = computeRequestHash(context);
+
   if (context.capability.riskScored && !isPreApproved) {
     riskResult = await scoreRisk(context);
-
-    if (riskResult.outcome === "block") {
-      writeAuditEntry(context, "blocked", riskResult.total, {
-        reasons: riskResult.reasons,
-      });
-
-      return {
-        success: false,
-        error: {
-          code: "risk_blocked",
-          type: "policy_error",
-          message:
-            `Operation blocked by risk engine (score: ${riskResult.total}). ` +
-            `Reasons: ${riskResult.reasons.join("; ")}`,
-        },
-      };
-    }
+    const block = checkRiskBlock(context, riskResult);
+    if (block) return block;
   }
 
-  // ── 5. Approval gate ────────────────────────────────────────────
-  if (
-    context.capability.approvalEligible &&
-    !isPreApproved &&
-    shouldRequireApproval(context)
-  ) {
+  if (!isPreApproved && shouldRequireApproval(context, riskResult)) {
     const approval = createApproval(context, riskResult?.total ?? 0);
-
     writeAuditEntry(context, "pending_approval", riskResult?.total ?? null, {
       approval_token: approval.token,
       expires_at: approval.expiresAt,
     });
-
     return {
       success: false,
       error: {
         code: "approval_required",
         type: "policy_error",
         message:
-          `This operation requires approval. ` +
-          `Token: ${approval.token} | Expires: ${approval.expiresAt}. ` +
-          `Check status: GET http://localhost:${config.approvalPort}/approvals/${approval.token}. ` +
-          `Approve: POST .../approve | Reject: POST .../reject`,
+          `This operation requires approval. Token: ${approval.token} | Expires: ${approval.expiresAt}.`,
       },
     };
   }
 
-  // ── 6. Execute ──────────────────────────────────────────────────
+  const approvalToken = isPreApproved
+    ? (context.params.approval_token as string)
+    : null;
+
+  const reconcileParams = { ...context.params };
+  delete (reconcileParams as { approval_token?: string }).approval_token;
+
+  const begun = beginExecution(
+    approvalToken,
+    requestHash,
+    idempotencyKey,
+    WORKER_ID,
+    {
+      tool: context.capability.tool,
+      operation: context.capability.operation,
+      params: reconcileParams,
+    },
+  );
+
+  if (!begun.ok) {
+    return consumeFailureToResponse(begun.reason);
+  }
+
+  const executionId = begun.executionId;
+
   try {
     const result = await operation({ idempotencyKey });
+
+    const stripeObjectId =
+      result && typeof result === "object" && "id" in result
+        ? String((result as { id: unknown }).id)
+        : null;
+
+    updateExecutionStatus(executionId, "completed", { stripeObjectId });
 
     const metadata: Record<string, unknown> = { idempotency_key: idempotencyKey };
     if (isPreApproved) {
@@ -209,60 +195,141 @@ export async function executeStripeOperation<T>(
       metadata.risk_reasons = riskResult.reasons;
     }
 
-    try {
-      writeAuditEntry(
-        context,
-        "success",
-        riskResult ? riskResult.total : null,
-        metadata,
-      );
-    } catch (auditError) {
-      console.error(`stripe-mcp CRITICAL: Failed to write audit log for successful operation.`, auditError);
-    }
+    writeAuditEntry(
+      context,
+      "success",
+      riskResult ? riskResult.total : null,
+      metadata,
+    );
 
     return { success: true, data: result };
-
-    // ── 7. Error handling ───────────────────────────────────────
   } catch (error: unknown) {
     const errorResponse = toErrorResponse(error);
+    const lastError = toolErrorFromResponse(errorResponse);
+
+    const lastErrorRecord = lastError
+      ? (lastError as unknown as Record<string, unknown>)
+      : undefined;
+
+    if (isStripeTerminalError(error)) {
+      updateExecutionStatus(executionId, "failed_terminal", {
+        lastError: lastErrorRecord,
+      });
+    } else {
+      updateExecutionStatus(executionId, "unknown_outcome", {
+        lastError: lastErrorRecord,
+      });
+    }
 
     writeAuditEntry(context, "error", riskResult?.total ?? null, {
-      error:
-        errorResponse.success === false
-          ? errorResponse.error
-          : { code: "unknown" },
+      error: lastError ?? { code: "unknown" },
     });
 
     return errorResponse;
   }
 }
 
-// ── Approval policy ─────────────────────────────────────────────────
+function checkRiskBlock(
+  context: OperationContext,
+  riskResult: RiskScore,
+): McpToolResponse<never> | null {
+  if (!context.capability.riskScored || riskResult.outcome !== "block") {
+    return null;
+  }
 
-/**
- * Determine whether an operation requires human approval.
- *
- * Policy:
- * - `delete` and `purge`: always require approval
- * - `refund`: requires approval if amount > APPROVAL_REFUND_THRESHOLD
- * - `cancel`: requires approval if amount > APPROVAL_CANCEL_THRESHOLD
- * - All other operations: no approval required
- */
-function shouldRequireApproval(context: OperationContext): boolean {
+  writeAuditEntry(context, "blocked", riskResult.total, {
+    reasons: riskResult.reasons,
+  });
+
+  return {
+    success: false,
+    error: {
+      code: "risk_blocked",
+      type: "policy_error",
+      message:
+        `Operation blocked by risk engine (score: ${riskResult.total}). ` +
+        `Reasons: ${riskResult.reasons.join("; ")}`,
+    },
+  };
+}
+
+function shouldRequireApproval(
+  context: OperationContext,
+  riskResult?: RiskScore,
+): boolean {
   const op = context.capability.operation;
 
-  // Destructive operations always require approval
   if (op === "delete" || op === "purge") return true;
 
-  // High-value refunds
-  if (op === "refund" && (context.amount ?? 0) > config.approvalRefundThreshold) {
+  const amount = context.amount ?? 0;
+
+  if (op === "refund" && amount >= config.approvalRefundThreshold) {
     return true;
   }
 
-  // High-value subscription cancellations
-  if (op === "cancel" && (context.amount ?? 0) > config.approvalCancelThreshold) {
+  if (op === "cancel" && amount >= config.approvalCancelThreshold) {
+    return true;
+  }
+
+  if (
+    context.capability.approvalEligible &&
+    context.capability.riskScored &&
+    riskResult &&
+    riskResult.outcome === "flag"
+  ) {
     return true;
   }
 
   return false;
+}
+
+function policyError(code: string, message: string): McpToolResponse<never> {
+  return {
+    success: false,
+    error: { code, type: "policy_error", message },
+  };
+}
+
+function consumeFailureToResponse(
+  reason: ConsumeApprovalFailure | "duplicate_in_flight",
+): McpToolResponse<never> {
+  const map: Record<
+    ConsumeApprovalFailure | "duplicate_in_flight",
+    ToolError
+  > = {
+    not_found: {
+      code: "invalid_approval_token",
+      type: "policy_error",
+      message: "The provided approval token does not exist.",
+    },
+    not_approved: {
+      code: "token_not_approved",
+      type: "policy_error",
+      message: "The approval token is not in approved state.",
+    },
+    expired: {
+      code: "approval_expired",
+      type: "policy_error",
+      message: "The approval token has expired.",
+    },
+    hash_mismatch: {
+      code: "approval_hash_mismatch",
+      type: "policy_error",
+      message:
+        "Request parameters do not match the approved operation (hash mismatch).",
+    },
+    already_consumed: {
+      code: "token_already_consumed",
+      type: "policy_error",
+      message: "This approval token has already been consumed.",
+    },
+    duplicate_in_flight: {
+      code: "duplicate_in_flight",
+      type: "policy_error",
+      message:
+        "An execution with this idempotency_key is already in progress. Wait for it to finish or reconcile.",
+    },
+  };
+
+  return { success: false, error: map[reason] };
 }
