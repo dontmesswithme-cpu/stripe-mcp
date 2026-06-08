@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_tool_name    ON audit_log (tool_name);
 
 // ── Approvals DB schema ─────────────────────────────────────────────
 
-const APPROVALS_SCHEMA_V8 = `
+const APPROVALS_SCHEMA_V9 = `
 CREATE TABLE IF NOT EXISTS approvals (
   token                   TEXT    PRIMARY KEY,
   request_hash            TEXT    NOT NULL,
@@ -109,8 +109,7 @@ CREATE TABLE IF NOT EXISTS executions (
 CREATE INDEX IF NOT EXISTS idx_approvals_status     ON approvals (status);
 CREATE INDEX IF NOT EXISTS idx_approvals_expires_at ON approvals (expires_at);
 CREATE INDEX IF NOT EXISTS idx_executions_status    ON executions (status);
-CREATE INDEX IF NOT EXISTS idx_executions_idemp_key ON executions (idempotency_key);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_idemp_executing ON executions (idempotency_key) WHERE status = 'executing';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_idemp_key ON executions (idempotency_key);
 `;
 
 // ── Migration locking (multi-process safe) ──────────────────────────
@@ -136,9 +135,9 @@ function runApprovalsMigrations(db: Database.Database): void {
       const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='approvals'").get();
       
       if (!tableExists) {
-        db.exec(APPROVALS_SCHEMA_V8);
-        db.pragma("user_version = 8");
-        userVersion = 8;
+        db.exec(APPROVALS_SCHEMA_V9);
+        db.pragma("user_version = 9");
+        userVersion = 9;
       } else {
         // Table exists, treat as V1
         userVersion = 1;
@@ -433,6 +432,17 @@ function runApprovalsMigrations(db: Database.Database): void {
         ALTER TABLE executions ADD COLUMN reconcile_attempts INTEGER NOT NULL DEFAULT 0;
       `);
       db.pragma("user_version = 8");
+      userVersion = 8;
+    }
+
+    if (userVersion === 8) {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_executions_idemp_executing;
+        DROP INDEX IF EXISTS idx_executions_idemp_key;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_idemp_key ON executions (idempotency_key);
+      `);
+      db.pragma("user_version = 9");
+      userVersion = 9;
     }
 }
 

@@ -15,22 +15,19 @@ import {
   sweepStaleExecutions,
 } from "../src/execution/store.js";
 import { WORKER_ID } from "../src/worker/identity.js";
-import {
-  closeAllDatabases,
-  getApprovalsDb,
-  initializeAllDatabases,
-} from "../src/utils/db.js";
+import { runDbOp, shutdownDbWorker } from "../src/worker/db/db.client.js";
 import { executeStripeOperation } from "../src/middleware/execute.js";
 import { reconcileUnknownOutcomes } from "../src/reconciliation/worker.js";
 import { stripe } from "../src/stripe-client.js";
+import { config } from "../src/config.js";
 
 describe("Decoupled Execution & Approval Architecture", () => {
-  beforeAll(() => {
-    initializeAllDatabases();
+  beforeAll(async () => {
+    await runDbOp("initializeAllDatabases");
   });
 
-  afterAll(() => {
-    closeAllDatabases();
+  afterAll(async () => {
+    await shutdownDbWorker();
     try {
       rmSync(process.env.STRIPE_MCP_DATA_DIR!, {
         recursive: true,
@@ -57,13 +54,13 @@ describe("Decoupled Execution & Approval Architecture", () => {
         idempotency_key: "550e8400-e29b-41d4-a716-446655440001",
       },
     };
-    const approval = createApproval(context, 10);
-    approveToken(approval.token);
+    const approval = await createApproval(context, 10);
+    await approveToken(approval.token);
     context.params.approval_token = approval.token;
 
     await executeStripeOperation(context, async () => ({ id: "123" }));
 
-    const finalApproval = getApproval(approval.token);
+    const finalApproval = await getApproval(approval.token);
     expect(finalApproval?.status).toBe("consumed");
   });
 
@@ -81,8 +78,8 @@ describe("Decoupled Execution & Approval Architecture", () => {
         idempotency_key: "550e8400-e29b-41d4-a716-446655440002",
       },
     };
-    const approval = createApproval(context, 10);
-    approveToken(approval.token);
+    const approval = await createApproval(context, 10);
+    await approveToken(approval.token);
     context.params.approval_token = approval.token;
 
     await executeStripeOperation(context, async () => {
@@ -91,13 +88,11 @@ describe("Decoupled Execution & Approval Architecture", () => {
       });
     });
 
-    expect(getApproval(approval.token)?.status).toBe("consumed");
+    const finalApproval = await getApproval(approval.token);
+    expect(finalApproval?.status).toBe("consumed");
 
-    const db = getApprovalsDb();
-    const execRow = db
-      .prepare(`SELECT status FROM executions WHERE idempotency_key = ?`)
-      .get(context.params.idempotency_key) as { status: string };
-    expect(execRow.status).toBe("unknown_outcome");
+    const execRow = await runDbOp("testQuery", `SELECT status FROM executions WHERE idempotency_key LIKE ?`, `%${context.params.idempotency_key}`);
+    expect(execRow[0]?.status).toBe("unknown_outcome");
   });
 
   it("Consumed token cannot be executed again", async () => {
@@ -114,8 +109,8 @@ describe("Decoupled Execution & Approval Architecture", () => {
         idempotency_key: "550e8400-e29b-41d4-a716-446655440003",
       },
     };
-    const approval = createApproval(context, 10);
-    approveToken(approval.token);
+    const approval = await createApproval(context, 10);
+    await approveToken(approval.token);
     context.params.approval_token = approval.token;
 
     await executeStripeOperation(context, async () => ({ id: "first" }));
@@ -143,8 +138,8 @@ describe("Decoupled Execution & Approval Architecture", () => {
         idempotency_key: "550e8400-e29b-41d4-a716-446655440004",
       },
     };
-    const approval = createApproval(context, 10);
-    approveToken(approval.token);
+    const approval = await createApproval(context, 10);
+    await approveToken(approval.token);
     context.params.approval_token = approval.token;
 
     const res1 = await executeStripeOperation(context, async () => ({
@@ -175,23 +170,20 @@ describe("Decoupled Execution & Approval Architecture", () => {
         idempotency_key: "550e8400-e29b-41d4-a716-446655440005",
       },
     };
-    const approval = createApproval(context, 10);
-    approveToken(approval.token);
+    const approval = await createApproval(context, 10);
+    await approveToken(approval.token);
     context.params.approval_token = approval.token;
 
     await executeStripeOperation(context, async () => {
       throw Object.assign(new Error("Timeout"), { type: "api_error" });
     });
 
-    const db = getApprovalsDb();
-    const execRow = db
-      .prepare(`SELECT status FROM executions WHERE idempotency_key = ?`)
-      .get(context.params.idempotency_key) as { status: string };
-    expect(execRow.status).toBe("unknown_outcome");
+    const execRow = await runDbOp("testQuery", `SELECT status FROM executions WHERE idempotency_key LIKE ?`, `%${context.params.idempotency_key}`);
+    expect(execRow[0]?.status).toBe("unknown_outcome");
   });
 
   it("Reconciliation resolves unknown_outcome via idempotent replay", async () => {
-    const exec = createExecution(
+    const exec = await createExecution(
       null,
       "hash",
       "550e8400-e29b-41d4-a716-446655440006",
@@ -205,7 +197,7 @@ describe("Decoupled Execution & Approval Architecture", () => {
         },
       },
     );
-    updateExecutionStatus(exec.executionId, "unknown_outcome");
+    await updateExecutionStatus(exec.executionId, "unknown_outcome");
 
     const origDel = stripe.customers.del;
     stripe.customers.del = async () =>
@@ -219,21 +211,40 @@ describe("Decoupled Execution & Approval Architecture", () => {
 
     stripe.customers.del = origDel;
 
-    const resolved = getExecution(exec.executionId);
+    const resolved = await getExecution(exec.executionId);
     expect(resolved?.status).toBe("completed");
     expect(resolved?.stripeObjectId).toBe("cus_reconcile");
   });
 
-  it("Canonical nested hashing", () => {
+  it("Canonical nested hashing and array ordering", () => {
     const obj1 = { z: 1, a: [{ c: 3, b: 2 }, 4] };
     const obj2 = { a: [{ b: 2, c: 3 }, 4], z: 1 };
     expect(JSON.stringify(canonicalize(obj1))).toBe(
       JSON.stringify(canonicalize(obj2)),
     );
     const obj3 = { a: [4, { b: 2, c: 3 }], z: 1 };
-    expect(JSON.stringify(canonicalize(obj1))).not.toBe(
+    expect(JSON.stringify(canonicalize(obj1))).toBe(
       JSON.stringify(canonicalize(obj3)),
     );
+  });
+
+  it("Canonicalize prevents DoS via deep nesting", () => {
+    let deepObj: any = {};
+    let current = deepObj;
+    for (let i = 0; i < 15; i++) {
+      current.child = {};
+      current = current.child;
+    }
+    expect(() => canonicalize(deepObj)).toThrow("Maximum payload depth exceeded");
+
+    let deepArr: any[] = [];
+    let currentArr = deepArr;
+    for (let i = 0; i < 15; i++) {
+      let nextArr: any[] = [];
+      currentArr.push(nextArr);
+      currentArr = nextArr;
+    }
+    expect(() => canonicalize(deepArr)).toThrow("Maximum payload depth exceeded");
   });
 
   it("Concurrent execution attempts fail safely", async () => {
@@ -250,8 +261,8 @@ describe("Decoupled Execution & Approval Architecture", () => {
         idempotency_key: "550e8400-e29b-41d4-a716-446655440008",
       },
     };
-    const approval = createApproval(context, 10);
-    approveToken(approval.token);
+    const approval = await createApproval(context, 10);
+    await approveToken(approval.token);
     context.params.approval_token = approval.token;
 
     const p1 = executeStripeOperation(context, async () => {
@@ -266,8 +277,8 @@ describe("Decoupled Execution & Approval Architecture", () => {
     expect([res1.success, res2.success]).toContain(false);
   });
 
-  it("Stale executing rows are swept to unknown_outcome", () => {
-    const exec = createExecution(
+  it("Stale executing rows are swept to unknown_outcome", async () => {
+    const exec = await createExecution(
       null,
       "hash",
       "550e8400-e29b-41d4-a716-446655440009",
@@ -275,51 +286,44 @@ describe("Decoupled Execution & Approval Architecture", () => {
       { tool: "test_tool", operation: "delete", params: {} },
     );
 
-    const db = getApprovalsDb();
     const stale = new Date(Date.now() - 10 * 60_000).toISOString();
-    db.prepare(`UPDATE executions SET started_at = ? WHERE execution_id = ?`).run(
-      stale,
-      exec.executionId,
-    );
+    await runDbOp("testQuery", `UPDATE executions SET started_at = ? WHERE execution_id = ?`, stale, exec.executionId);
 
-    const swept = sweepStaleExecutions();
+    const swept = await sweepStaleExecutions();
     expect(swept).toBeGreaterThanOrEqual(1);
-    expect(getExecution(exec.executionId)?.status).toBe("unknown_outcome");
+    
+    const read = await getExecution(exec.executionId);
+    expect(read?.status).toBe("unknown_outcome");
   });
 
-  it("Legacy migration invalidates empty request_hash approvals", () => {
-    const db = getApprovalsDb();
-    db.prepare(`
+  it("Legacy migration invalidates empty request_hash approvals", async () => {
+    await runDbOp("testQuery", `
       INSERT INTO approvals (token, request_hash, tool, operation, status, expires_at)
       VALUES ('legacy_token', '', 'tool', 'op', 'pending', ?)
-    `).run(new Date(Date.now() + 60_000).toISOString());
+    `, new Date(Date.now() + 60_000).toISOString());
 
-    db.prepare(
-      `UPDATE approvals SET status = 'expired' WHERE request_hash = '' AND status = 'pending'`,
-    ).run();
+    await runDbOp("testQuery", `UPDATE approvals SET status = 'expired' WHERE request_hash = '' AND status = 'pending'`);
 
-    const row = db
-      .prepare(`SELECT status FROM approvals WHERE token = 'legacy_token'`)
-      .get() as { status: string };
-    expect(row.status).toBe("expired");
+    const row = await runDbOp("testQuery", `SELECT status FROM approvals WHERE token = 'legacy_token'`);
+    expect(row[0]?.status).toBe("expired");
   });
 
-  it("Worker ownership persistence", () => {
-    const exec = createExecution(
+  it("Worker ownership persistence", async () => {
+    const exec = await createExecution(
       "token_11",
       "hash",
       "550e8400-e29b-41d4-a716-446655440011",
       { hostname: "my-host", pid: 1234, uuid: "my-uuid" },
       { tool: "test_tool", operation: "delete", params: {} },
     );
-    const read = getExecution(exec.executionId);
+    const read = await getExecution(exec.executionId);
     expect(read?.workerHostname).toBe("my-host");
     expect(read?.workerPid).toBe(1234);
     expect(read?.workerUuid).toBe("my-uuid");
   });
 
-  it("Execution records survive process restart", () => {
-    const exec = createExecution(
+  it("Execution records survive process restart", async () => {
+    const exec = await createExecution(
       "token_12",
       "hash",
       "550e8400-e29b-41d4-a716-446655440012",
@@ -327,25 +331,18 @@ describe("Decoupled Execution & Approval Architecture", () => {
       { tool: "test_tool", operation: "delete", params: {} },
     );
 
-    closeAllDatabases();
+    await shutdownDbWorker();
+    await runDbOp("initializeAllDatabases"); // restart
 
-    const db = getApprovalsDb();
-    const read = db
-      .prepare(`SELECT * FROM executions WHERE execution_id = ?`)
-      .get(exec.executionId);
-    expect(read).toBeDefined();
+    const read = await runDbOp("testQuery", `SELECT * FROM executions WHERE execution_id = ?`, exec.executionId);
+    expect(read[0]).toBeDefined();
   });
 
   it("STRIPE_READ_ONLY blocks mutations", async () => {
-    vi.resetModules();
-    vi.stubEnv("STRIPE_READ_ONLY", "true");
-    vi.stubEnv("STRIPE_API_KEY", "dummy_stripe_key_for_testing");
+    const origReadOnly = config.readOnly;
+    config.readOnly = true;
 
-    const { executeStripeOperation: executeReadOnly } = await import(
-      "../src/middleware/execute.js"
-    );
-
-    const result = await executeReadOnly(
+    const result = await executeStripeOperation(
       {
         capability: {
           tool: "test_tool",
@@ -366,8 +363,7 @@ describe("Decoupled Execution & Approval Architecture", () => {
       expect(result.error.code).toBe("read_only");
     }
 
-    vi.unstubAllEnvs();
-    vi.resetModules();
+    config.readOnly = origReadOnly;
   });
 });
 

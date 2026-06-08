@@ -1,19 +1,32 @@
 # Build output
 dist/
+.tsbuildinfo
 
 # Dependencies
 node_modules/
+.npm/
 
 # Environment
 .env
 .env.local
 .env.*.local
 
+# Databases & Local State
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/
+data-test/
+audit_archive.csv
+
 # Source maps
 *.js.map
 
-# Test coverage
+# Test coverage & Caches
 coverage/
+.eslintcache
 
 # OS files
 .DS_Store
@@ -28,3 +41,13 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Ignored temporary files/folders
+Don't commit/
+Dont commit 2/
+Dont commit 3/
+flaw_corrections.md
+output.txt
+trace.txt

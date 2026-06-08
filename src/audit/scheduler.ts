@@ -1,11 +1,11 @@
 /**
- * @module reconciliation/scheduler
+ * @module audit/scheduler
  *
- * Single-flight reconciliation loop (no overlapping cycles).
+ * Single-flight audit log pruning loop.
  */
 
 import { config } from "../config.js";
-import { runReconciliationCycle } from "./worker.js";
+import { pruneAuditLog } from "./prune.js";
 import { logger } from "../utils/logger.js";
 
 let stopped = false;
@@ -27,24 +27,26 @@ async function runCycle(): Promise<void> {
 
   cycleInFlight = true;
   try {
-    await runReconciliationCycle();
+    // Run asynchronously
+    await pruneAuditLog();
   } catch (error) {
     logger.error(
       { error: error instanceof Error ? error.message : String(error) },
-      "[RECONCILIATION] Cycle failed"
+      "[AUDIT PRUNE] Cycle failed"
     );
   } finally {
     cycleInFlight = false;
-    scheduleNext(config.reconciliationIntervalMs);
+    scheduleNext(config.auditPruneIntervalMs);
   }
 }
 
-export function startReconciliationLoop(): void {
+export function startAuditPruneLoop(): void {
   stopped = false;
+  // Trigger immediately on startup, then schedule
   void runCycle();
 }
 
-export function stopReconciliationLoop(): void {
+export function stopAuditPruneLoop(): void {
   stopped = true;
   if (timer !== null) {
     clearTimeout(timer);

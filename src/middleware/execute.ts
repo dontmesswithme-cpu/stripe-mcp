@@ -21,6 +21,8 @@ import {
   toolErrorFromResponse,
 } from "../utils/errors.js";
 import type { McpToolResponse, OperationContext, RiskScore, ToolError } from "../types.js";
+import { logger } from "../utils/logger.js";
+import { createHash } from "node:crypto";
 
 export async function executeStripeOperation<T>(
   context: OperationContext,
@@ -32,9 +34,9 @@ export async function executeStripeOperation<T>(
     );
   }
 
-  const idempotencyKey = context.params.idempotency_key as string | undefined;
+  const rawIdempotencyKey = context.params.idempotency_key as string | undefined;
 
-  if (!idempotencyKey) {
+  if (!rawIdempotencyKey) {
     return {
       success: false,
       error: {
@@ -45,8 +47,14 @@ export async function executeStripeOperation<T>(
     };
   }
 
+  const scopePrefix = context.customerId
+    ? context.customerId
+    : createHash("sha256").update(JSON.stringify(context.params)).digest("hex").slice(0, 16);
+
+  const idempotencyKey = `${scopePrefix}:${rawIdempotencyKey}`;
+
   if (config.readOnly) {
-    writeAuditEntry(context, "blocked", null, {
+    await writeAuditEntry(context, "blocked", null, {
       reason: "read_only_mode",
       idempotency_key: idempotencyKey,
     });
@@ -65,7 +73,7 @@ export async function executeStripeOperation<T>(
   let riskResult: RiskScore | undefined;
 
   if (context.capability.approvalEligible && context.params.approval_token) {
-    const approval = getApproval(context.params.approval_token as string);
+    const approval = await getApproval(context.params.approval_token as string);
 
     if (!approval) {
       return policyError(
@@ -94,8 +102,12 @@ export async function executeStripeOperation<T>(
 
   if (config.dryRun) {
     if (context.capability.riskScored && !isPreApproved) {
-      riskResult = await scoreRisk(context);
-      const block = checkRiskBlock(context, riskResult);
+      try {
+        riskResult = await scoreRisk(context);
+      } catch (error) {
+        return toErrorResponse(error);
+      }
+      const block = await checkRiskBlock(context, riskResult);
       if (block) return block;
     }
 
@@ -106,7 +118,7 @@ export async function executeStripeOperation<T>(
     if (isPreApproved) {
       metadata.pre_approved_by_token = context.params.approval_token;
     }
-    writeAuditEntry(
+    await writeAuditEntry(
       context,
       "dry_run",
       riskResult ? riskResult.total : null,
@@ -129,14 +141,18 @@ export async function executeStripeOperation<T>(
   const requestHash = computeRequestHash(context);
 
   if (context.capability.riskScored && !isPreApproved) {
-    riskResult = await scoreRisk(context);
-    const block = checkRiskBlock(context, riskResult);
+    try {
+      riskResult = await scoreRisk(context);
+    } catch (error) {
+      return toErrorResponse(error);
+    }
+    const block = await checkRiskBlock(context, riskResult);
     if (block) return block;
   }
 
   if (!isPreApproved && shouldRequireApproval(context, riskResult)) {
-    const approval = createApproval(context, riskResult?.total ?? 0);
-    writeAuditEntry(context, "pending_approval", riskResult?.total ?? null, {
+    const approval = await createApproval(context, riskResult?.total ?? 0);
+    await writeAuditEntry(context, "pending_approval", riskResult?.total ?? null, {
       approval_token: approval.token,
       expires_at: approval.expiresAt,
     });
@@ -158,7 +174,7 @@ export async function executeStripeOperation<T>(
   const reconcileParams = { ...context.params };
   delete (reconcileParams as { approval_token?: string }).approval_token;
 
-  const begun = beginExecution(
+  const begun = await beginExecution(
     approvalToken,
     requestHash,
     idempotencyKey,
@@ -175,6 +191,8 @@ export async function executeStripeOperation<T>(
   }
 
   const executionId = begun.executionId;
+  const execLogger = logger.child({ worker_id: WORKER_ID, execution_id: executionId, idempotency_key: idempotencyKey });
+  execLogger.info("execution started");
 
   try {
     const result = await operation({ idempotencyKey });
@@ -184,7 +202,8 @@ export async function executeStripeOperation<T>(
         ? String((result as { id: unknown }).id)
         : null;
 
-    updateExecutionStatus(executionId, "completed", { stripeObjectId });
+    await updateExecutionStatus(executionId, "completed", { stripeObjectId });
+    execLogger.info({ stripeObjectId }, "execution completed");
 
     const metadata: Record<string, unknown> = { idempotency_key: idempotencyKey };
     if (isPreApproved) {
@@ -195,7 +214,7 @@ export async function executeStripeOperation<T>(
       metadata.risk_reasons = riskResult.reasons;
     }
 
-    writeAuditEntry(
+    await writeAuditEntry(
       context,
       "success",
       riskResult ? riskResult.total : null,
@@ -212,16 +231,18 @@ export async function executeStripeOperation<T>(
       : undefined;
 
     if (isStripeTerminalError(error)) {
-      updateExecutionStatus(executionId, "failed_terminal", {
+      await updateExecutionStatus(executionId, "failed_terminal", {
         lastError: lastErrorRecord,
       });
+      execLogger.error({ error: lastErrorRecord }, "execution failed (terminal)");
     } else {
-      updateExecutionStatus(executionId, "unknown_outcome", {
+      await updateExecutionStatus(executionId, "unknown_outcome", {
         lastError: lastErrorRecord,
       });
+      execLogger.error({ error: lastErrorRecord }, "execution failed (unknown outcome)");
     }
 
-    writeAuditEntry(context, "error", riskResult?.total ?? null, {
+    await writeAuditEntry(context, "error", riskResult?.total ?? null, {
       error: lastError ?? { code: "unknown" },
     });
 
@@ -229,15 +250,15 @@ export async function executeStripeOperation<T>(
   }
 }
 
-function checkRiskBlock(
+async function checkRiskBlock(
   context: OperationContext,
   riskResult: RiskScore,
-): McpToolResponse<never> | null {
+): Promise<McpToolResponse<never> | null> {
   if (!context.capability.riskScored || riskResult.outcome !== "block") {
     return null;
   }
 
-  writeAuditEntry(context, "blocked", riskResult.total, {
+  await writeAuditEntry(context, "blocked", riskResult.total, {
     reasons: riskResult.reasons,
   });
 
@@ -291,10 +312,10 @@ function policyError(code: string, message: string): McpToolResponse<never> {
 }
 
 function consumeFailureToResponse(
-  reason: ConsumeApprovalFailure | "duplicate_in_flight",
+  reason: ConsumeApprovalFailure | "duplicate_in_flight" | "already_completed",
 ): McpToolResponse<never> {
   const map: Record<
-    ConsumeApprovalFailure | "duplicate_in_flight",
+    ConsumeApprovalFailure | "duplicate_in_flight" | "already_completed",
     ToolError
   > = {
     not_found: {
@@ -328,6 +349,12 @@ function consumeFailureToResponse(
       type: "policy_error",
       message:
         "An execution with this idempotency_key is already in progress. Wait for it to finish or reconcile.",
+    },
+    already_completed: {
+      code: "already_completed",
+      type: "policy_error",
+      message:
+        "An execution with this idempotency_key has already been processed.",
     },
   };
 

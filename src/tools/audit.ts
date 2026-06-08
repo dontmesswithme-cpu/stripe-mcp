@@ -51,7 +51,7 @@ export async function getAuditLog(
       limit: input.limit,
     };
 
-    const entries = queryAuditLog(filters);
+    const entries = await queryAuditLog(filters);
 
     return { success: true, data: entries };
   } catch (error: unknown) {
@@ -90,7 +90,7 @@ export async function getApprovalStatus(
   input: GetApprovalStatusInput,
 ): Promise<McpToolResponse<ApprovalToken>> {
   try {
-    const approval = getApproval(input.token);
+    const approval = await getApproval(input.token);
 
     if (approval === null) {
       return {

@@ -15,15 +15,17 @@ import {
   canReplayExecution,
   replayStripeMutation,
 } from "./replay.js";
+import { logger } from "../utils/logger.js";
 
 /**
  * Sweeps stale executing rows, then resolves unknown_outcome executions.
  */
 export async function runReconciliationCycle(): Promise<void> {
-  const swept = sweepStaleExecutions();
+  const swept = await sweepStaleExecutions();
   if (swept > 0) {
-    console.error(
-      `[RECONCILIATION] Marked ${swept} stale executing row(s) as unknown_outcome`,
+    logger.warn(
+      { sweptCount: swept },
+      "Marked stale executing row(s) as unknown_outcome"
     );
   }
 
@@ -31,7 +33,7 @@ export async function runReconciliationCycle(): Promise<void> {
 }
 
 export async function reconcileUnknownOutcomes(): Promise<void> {
-  const unknownExecutions = findUnknownOutcomes();
+  const unknownExecutions = await findUnknownOutcomes();
   if (unknownExecutions.length === 0) return;
 
   const retryIntervalMs = config.reconciliationRetryIntervalMs;
@@ -43,10 +45,11 @@ export async function reconcileUnknownOutcomes(): Promise<void> {
       const ageMs = now - new Date(execution.startedAt).getTime();
 
       if (ageMs > maxAgeMs) {
-        console.error(
-          `[RECONCILIATION] execution ${execution.executionId} -> cancelled (age > ${config.reconciliationMaxAgeHours}h)`,
+        logger.warn(
+          { executionId: execution.executionId, ageMs, maxAgeMs },
+          "execution cancelled (age > max)"
         );
-        updateExecutionStatus(execution.executionId, "cancelled");
+        await updateExecutionStatus(execution.executionId, "cancelled");
         continue;
       }
 
@@ -57,7 +60,7 @@ export async function reconcileUnknownOutcomes(): Promise<void> {
         }
       }
 
-      recordReconcileAttempt(execution.executionId);
+      await recordReconcileAttempt(execution.executionId);
 
       if (!canReplayExecution(execution)) {
         continue;
@@ -66,22 +69,24 @@ export async function reconcileUnknownOutcomes(): Promise<void> {
       const result = await replayStripeMutation(execution);
 
       if (result.status === "completed") {
-        updateExecutionStatus(execution.executionId, "completed", {
+        await updateExecutionStatus(execution.executionId, "completed", {
           stripeObjectId: result.stripeObjectId,
         });
-        console.error(
-          `[RECONCILIATION] execution ${execution.executionId} -> completed (idempotent replay)`,
+        logger.info(
+          { executionId: execution.executionId, stripeObjectId: result.stripeObjectId },
+          "execution completed (idempotent replay)"
         );
       } else if (result.status === "failed_terminal") {
-        updateExecutionStatus(execution.executionId, "failed_terminal");
-        console.error(
-          `[RECONCILIATION] execution ${execution.executionId} -> failed_terminal (replay)`,
+        await updateExecutionStatus(execution.executionId, "failed_terminal");
+        logger.error(
+          { executionId: execution.executionId },
+          "execution failed_terminal (replay)"
         );
       }
     } catch (error) {
-      console.error(
-        `[RECONCILIATION] Failed to reconcile execution ${execution.executionId}`,
-        error,
+      logger.error(
+        { executionId: execution.executionId, error: error instanceof Error ? error.message : String(error) },
+        "Failed to reconcile execution"
       );
     }
   }

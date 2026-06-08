@@ -8,6 +8,8 @@
  * All stderr-safe: no stdout output.
  */
 
+import { createHash } from "node:crypto";
+
 // ── Parsing helpers ─────────────────────────────────────────────────
 
 function envBool(key: string, fallback: boolean): boolean {
@@ -33,6 +35,12 @@ function envStr(key: string, fallback: string): string {
   return val !== undefined && val !== "" ? val : fallback;
 }
 
+function envStrHashed(key: string, fallback: string): string {
+  const val = process.env[key];
+  if (val === undefined || val === "") return fallback;
+  return createHash("sha256").update(val).digest("hex");
+}
+
 // ── Configuration interface ─────────────────────────────────────────
 
 /** Typed, readonly configuration for stripe-mcp. */
@@ -43,7 +51,7 @@ export interface StripeMcpConfig {
   readonly dataDir: string;
 
   // ── Approval server
-  readonly approvalApiKey: string;
+  readonly approvalApiHash: string;
   readonly approvalPort: number;
   readonly approvalExpiryMinutes: number;
   readonly approvalRefundThreshold: number;
@@ -59,6 +67,10 @@ export interface StripeMcpConfig {
 
   // ── Archive
   readonly archiveDeleteAfterDays: number;
+
+  // ── Audit Pruning
+  readonly auditRetentionDays: number;
+  readonly auditPruneIntervalMs: number;
 
   // ── Execution / reconciliation
   readonly executionStaleMinutes: number;
@@ -77,14 +89,14 @@ export interface StripeMcpConfig {
  * Frozen configuration object. Values are parsed from `process.env`
  * at module load time and never change.
  */
-export const config: StripeMcpConfig = Object.freeze({
+export const config: StripeMcpConfig = {
   // Core
   readOnly: envBool("STRIPE_READ_ONLY", false),
   dryRun: envBool("STRIPE_DRY_RUN", false),
   dataDir: envStr("STRIPE_MCP_DATA_DIR", "./data"),
 
   // Approval server
-  approvalApiKey: envStr("APPROVAL_API_KEY", ""),
+  approvalApiHash: envStrHashed("APPROVAL_API_KEY", ""),
   approvalPort: envInt("APPROVAL_PORT", 3001),
   approvalExpiryMinutes: envInt("APPROVAL_EXPIRY_MINUTES", 60),
   approvalRefundThreshold: envInt("APPROVAL_REFUND_THRESHOLD", 100_000),
@@ -101,6 +113,10 @@ export const config: StripeMcpConfig = Object.freeze({
   // Archive
   archiveDeleteAfterDays: envInt("ARCHIVE_DELETE_AFTER_DAYS", 14),
 
+  // Audit Pruning
+  auditRetentionDays: envInt("AUDIT_RETENTION_DAYS", 90),
+  auditPruneIntervalMs: envInt("AUDIT_PRUNE_INTERVAL_MS", 86_400_000),
+
   // Execution / reconciliation
   executionStaleMinutes: envInt("EXECUTION_STALE_MINUTES", 5),
   reconciliationIntervalMs: envInt("RECONCILIATION_INTERVAL_MS", 60_000),
@@ -108,4 +124,4 @@ export const config: StripeMcpConfig = Object.freeze({
   reconciliationMaxAgeHours: envInt("RECONCILIATION_MAX_AGE_HOURS", 24),
   stripeWriteConcurrency: envInt("STRIPE_WRITE_CONCURRENCY", 3),
   stripeWriteIntervalMs: envInt("STRIPE_WRITE_INTERVAL_MS", 150),
-});
+};

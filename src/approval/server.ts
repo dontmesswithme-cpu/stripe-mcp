@@ -5,53 +5,55 @@
  */
 
 import { createServer, type Server } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, createHash } from "node:crypto";
 import { config } from "../config.js";
 import { getApproval, approveToken, rejectToken } from "./store.js";
+import { logger } from "../utils/logger.js";
 
-const UUID_PATTERN =
-  /^\/approvals\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?(.*)$/;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 let activeServer: Server | null = null;
 
-function bearerMatches(provided: string, expected: string): boolean {
+export function bearerMatches(provided: string, expectedHashHex: string): boolean {
   const prefix = "Bearer ";
   if (!provided.startsWith(prefix)) return false;
   const token = provided.slice(prefix.length);
-  const a = Buffer.from(token);
-  const b = Buffer.from(expected);
+  const a = createHash("sha256").update(token).digest();
+  const b = Buffer.from(expectedHashHex, "hex");
   if (a.length !== b.length) return false;
   return timingSafeEqual(a, b);
 }
 
 export function startApprovalServer(): Server | null {
   if (config.approvalPort === 0) {
-    console.error("stripe-mcp: approval server disabled (APPROVAL_PORT=0)");
+    logger.warn("approval server disabled (APPROVAL_PORT=0)");
     return null;
   }
 
-  if (!config.approvalApiKey) {
-    console.error("stripe-mcp: approval server disabled (APPROVAL_API_KEY not set)");
+  if (!config.approvalApiHash) {
+    logger.warn("approval server disabled (APPROVAL_API_KEY not set)");
     return null;
   }
 
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     res.setHeader("Content-Type", "application/json");
 
-    const match = (req.url ?? "").match(UUID_PATTERN);
-    if (!match) {
+    const parsedUrl = new URL(req.url ?? "", "http://localhost");
+    const pathParts = parsedUrl.pathname.split("/").filter(Boolean);
+
+    if (pathParts[0] !== "approvals" || !pathParts[1] || !UUID_REGEX.test(pathParts[1])) {
       res.writeHead(404);
       res.end(JSON.stringify({ error: "Not found. Use /approvals/{token}" }));
       return;
     }
 
-    const token = match[1]!;
-    const action = match[2] ?? "";
+    const token = pathParts[1];
+    const action = pathParts[2] ?? "";
 
     const authHeader = req.headers.authorization;
     if (
       !authHeader ||
-      !bearerMatches(authHeader, config.approvalApiKey)
+      !bearerMatches(authHeader, config.approvalApiHash)
     ) {
       res.writeHead(401);
       res.end(JSON.stringify({ error: "Unauthorized. Provide Bearer token." }));
@@ -59,7 +61,7 @@ export function startApprovalServer(): Server | null {
     }
 
     if (req.method === "GET" && action === "") {
-      const approval = getApproval(token);
+      const approval = await getApproval(token);
       if (approval === null) {
         res.writeHead(404);
         res.end(JSON.stringify({ error: "Token not found" }));
@@ -71,7 +73,7 @@ export function startApprovalServer(): Server | null {
     }
 
     if (req.method === "POST" && action === "approve") {
-      const approval = approveToken(token);
+      const approval = await approveToken(token);
       if (approval === null) {
         res.writeHead(404);
         res.end(
@@ -81,14 +83,14 @@ export function startApprovalServer(): Server | null {
         );
         return;
       }
-      console.error(`stripe-mcp: approval ${token} APPROVED`);
+      logger.info({ token }, "approval APPROVED");
       res.writeHead(200);
       res.end(JSON.stringify(approval, null, 2));
       return;
     }
 
     if (req.method === "POST" && action === "reject") {
-      const approval = rejectToken(token);
+      const approval = await rejectToken(token);
       if (approval === null) {
         res.writeHead(404);
         res.end(
@@ -98,7 +100,7 @@ export function startApprovalServer(): Server | null {
         );
         return;
       }
-      console.error(`stripe-mcp: approval ${token} REJECTED`);
+      logger.info({ token }, "approval REJECTED");
       res.writeHead(200);
       res.end(JSON.stringify(approval, null, 2));
       return;
@@ -113,8 +115,9 @@ export function startApprovalServer(): Server | null {
   });
 
   server.listen(config.approvalPort, "127.0.0.1", () => {
-    console.error(
-      `stripe-mcp: approval server listening on http://127.0.0.1:${config.approvalPort}`,
+    logger.info(
+      { port: config.approvalPort },
+      "approval server listening"
     );
   });
 

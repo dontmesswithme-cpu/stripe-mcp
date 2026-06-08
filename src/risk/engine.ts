@@ -24,6 +24,56 @@ import type {
   RiskScore,
 } from "../types.js";
 
+// ── LRU Cache ───────────────────────────────────────────────────────
+
+class LRUCache<T> {
+  private cache = new Map<string, { value: T; expiresAt: number }>();
+  private sweepInterval: NodeJS.Timeout;
+  
+  constructor(private maxItems: number, private ttlMs: number) {
+    this.sweepInterval = setInterval(() => this.sweep(), Math.min(ttlMs, 60000));
+    if (this.sweepInterval.unref) {
+      this.sweepInterval.unref();
+    }
+  }
+
+  private sweep(): void {
+    const now = Date.now();
+    for (const [key, item] of this.cache.entries()) {
+      if (now > item.expiresAt) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  get(key: string): T | undefined {
+    const item = this.cache.get(key);
+    if (!item) return undefined;
+    if (Date.now() > item.expiresAt) {
+      this.cache.delete(key);
+      return undefined;
+    }
+    this.cache.delete(key);
+    this.cache.set(key, item);
+    return item.value;
+  }
+
+  set(key: string, value: T): void {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= this.maxItems) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+          this.cache.delete(oldestKey);
+      }
+    }
+    this.cache.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+}
+
+const customerCache = new LRUCache<Stripe.Customer | Stripe.DeletedCustomer>(1000, 10 * 60 * 1000);
+const refundStatsCache = new LRUCache<{ total: number; refunded: number }>(1000, 10 * 60 * 1000);
+
 // ── Public API ──────────────────────────────────────────────────────
 
 /**
@@ -54,7 +104,7 @@ export async function scoreRisk(
 
   // ── Customer-scoped factors (require customerId) ────────────────
   if (context.customerId !== undefined) {
-    checkVelocity(context, factors);
+    await checkVelocity(context, factors);
     await checkCustomerFactors(context, factors);
   }
 
@@ -141,17 +191,17 @@ function checkRefundSpecificFactors(
 }
 
 /** Velocity checks — 24h and 30d windows from the audit log. */
-function checkVelocity(
+async function checkVelocity(
   context: OperationContext,
   factors: RiskFactor[],
-): void {
+): Promise<void> {
   if (context.customerId === undefined) return;
 
   const now = Date.now();
   const since24h = new Date(now - 24 * 60 * 60 * 1000).toISOString();
   const since30d = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-  const count24h = countRecentOperations(
+  const count24h = await countRecentOperations(
     context.customerId,
     context.capability.operation,
     since24h,
@@ -167,7 +217,7 @@ function checkVelocity(
     });
   }
 
-  const count30d = countRecentOperations(
+  const count30d = await countRecentOperations(
     context.customerId,
     context.capability.operation,
     since30d,
@@ -197,12 +247,30 @@ async function checkCustomerFactors(
 
   let customer: Stripe.Customer;
   try {
-    const result = await stripe.customers.retrieve(context.customerId);
+    let result = customerCache.get(context.customerId);
+    if (!result) {
+      result = await stripe.customers.retrieve(context.customerId);
+      customerCache.set(context.customerId, result);
+    }
     // Deleted customers can't be scored further
     if ("deleted" in result && result.deleted) return;
     customer = result as Stripe.Customer;
-  } catch {
-    // Customer lookup failed — skip customer-scoped checks
+  } catch (error: any) {
+    if (
+      error?.statusCode === 429 ||
+      (error?.statusCode && error.statusCode >= 500) ||
+      error?.type === "StripeRateLimitError" ||
+      error?.type === "StripeAPIError" ||
+      error?.type === "StripeConnectionError"
+    ) {
+      throw new Error("Service Unavailable");
+    }
+    // Customer lookup failed — enforce fail-closed policy
+    factors.push({
+      name: "risk_evaluation_failure",
+      description: "Failed to evaluate customer risk factors due to API error",
+      points: config.riskBlockThreshold,
+    });
     return;
   }
 
@@ -240,28 +308,47 @@ async function checkRefundRatio(
   factors: RiskFactor[],
 ): Promise<void> {
   try {
-    const charges = await stripe.charges.list({
-      customer: customerId,
-      limit: 100,
-    });
+    let stats = refundStatsCache.get(customerId);
+    if (!stats) {
+      let total = 0;
+      let refunded = 0;
+      for await (const charge of stripe.charges.list({ customer: customerId })) {
+        total++;
+        if (charge.refunded || charge.amount_refunded > 0) {
+          refunded++;
+        }
+      }
+      stats = { total, refunded };
+      refundStatsCache.set(customerId, stats);
+    }
 
-    if (charges.data.length === 0) return;
+    if (stats.total === 0) return;
 
-    const refundedCount = charges.data.filter(
-      (c) => c.refunded || c.amount_refunded > 0,
-    ).length;
-
-    const ratio = refundedCount / charges.data.length;
+    const ratio = stats.refunded / stats.total;
     if (ratio > 0.3) {
       factors.push({
         name: "high_refund_ratio",
         description:
           `Refund ratio ${(ratio * 100).toFixed(0)}% ` +
-          `(${refundedCount}/${charges.data.length} charges refunded)`,
+          `(${stats.refunded}/${stats.total} charges refunded)`,
         points: 15,
       });
     }
-  } catch {
-    // Charge lookup failed — skip this factor
+  } catch (error: any) {
+    if (
+      error?.statusCode === 429 ||
+      (error?.statusCode && error.statusCode >= 500) ||
+      error?.type === "StripeRateLimitError" ||
+      error?.type === "StripeAPIError" ||
+      error?.type === "StripeConnectionError"
+    ) {
+      throw new Error("Service Unavailable");
+    }
+    // Charge lookup failed — enforce fail-closed policy
+    factors.push({
+      name: "risk_evaluation_failure",
+      description: "Failed to evaluate refund ratio due to API error",
+      points: config.riskBlockThreshold,
+    });
   }
 }
