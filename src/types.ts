@@ -238,6 +238,30 @@ export const BaseMutationSchema = z.object({
  */
 const MetadataSchema = z
   .record(z.string(), z.string())
+  .superRefine((val, ctx) => {
+    const keys = Object.keys(val);
+    if (keys.length > 50) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Metadata must contain at most 50 keys.",
+      });
+    }
+    for (const key of keys) {
+      if (key.length > 40) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Metadata key "${key}" exceeds 40 characters.`,
+        });
+      }
+      const value = val[key];
+      if (typeof value === "string" && value.length > 500) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Metadata value for key "${key}" exceeds 500 characters.`,
+        });
+      }
+    }
+  })
   .optional()
   .describe(
     "Arbitrary key-value metadata to attach to the Stripe object. " +
@@ -647,6 +671,8 @@ export const UpdateSubscriptionSchema = z.object({
           .boolean()
           .optional()
           .describe("Set to true to remove this item from the subscription."),
+      }).refine((item) => item.deleted !== true || item.id !== undefined, {
+        message: "Field 'id' is required when 'deleted' is true.",
       }),
     )
     .optional()

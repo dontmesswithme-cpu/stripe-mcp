@@ -55,12 +55,19 @@ const createProductCapability: ToolCapability = {
 export async function createProduct(
   input: CreateProductInput,
 ): Promise<McpToolResponse<Stripe.Product>> {
+  // Inline default_price_data creates a Price alongside the Product, so it
+  // must carry the same risk/approval gating as create_price. A plain
+  // product with no price defines no charge and stays ungated to avoid
+  // over-gating catalog-only writes.
+  const hasInlinePrice = input.default_price_data !== undefined;
   return executeStripeOperation(
     {
-      capability: createProductCapability,
+      capability: hasInlinePrice
+        ? { ...createProductCapability, riskScored: true, approvalEligible: true }
+        : createProductCapability,
       customerId: undefined,
-      amount: undefined,
-      currency: undefined,
+      amount: input.default_price_data?.unit_amount,
+      currency: input.default_price_data?.currency,
       params: input as Record<string, unknown>,
     },
     (options) => {
@@ -128,8 +135,8 @@ const createPriceCapability: ToolCapability = {
   tool: "create_price",
   operation: "create",
   readOnly: false,
-  riskScored: false,
-  approvalEligible: false,
+  riskScored: true,
+  approvalEligible: true,
 };
 
 /**

@@ -11,7 +11,10 @@
  * reads and powers the `get_audit_log` MCP tool.
  */
 
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { getAuditDb } from "../utils/db.js";
+import { config } from "../config.js";
 import type { AuditEntry, AuditFilters, OperationContext } from "../types.js";
 import { logger } from "../utils/logger.js";
 
@@ -71,6 +74,62 @@ export function writeAuditEntry(
       { error: error instanceof Error ? error.message : String(error) },
       "stripe-mcp CRITICAL: Failed to write audit log"
     );
+    // Fallback persistence: money may still move (audit is best-effort per
+    // README), so preserve a JSON-lines trail on disk. Never throws.
+    persistAuditFallback(context, outcome, riskScore, metadata, error);
+  }
+}
+
+/**
+ * Append a JSON-lines record to `<dataDir>/audit-fallback.log`.
+ *
+ * @description Synchronous file append — microsecond-scale, safe to call
+ *   on the hot path. Never throws: all I/O and serialization errors are
+ *   swallowed (a `logger.fatal` has already been emitted by the caller).
+ */
+function persistAuditFallback(
+  context: OperationContext,
+  outcome: AuditEntry["outcome"],
+  riskScore: number | null,
+  metadata: Record<string, unknown>,
+  dbError: unknown,
+): void {
+  try {
+    mkdirSync(config.dataDir, { recursive: true });
+    const record = {
+      fallback: true,
+      timestamp: new Date().toISOString(),
+      tool_name: context.capability.tool,
+      customer_id: context.customerId ?? null,
+      operation_type: context.capability.operation,
+      amount: context.amount ?? null,
+      currency: context.currency ?? null,
+      outcome,
+      risk_score: riskScore,
+      metadata,
+      audit_error: dbError instanceof Error ? dbError.message : String(dbError),
+    };
+    let line: string;
+    try {
+      line = JSON.stringify(record);
+    } catch {
+      line = JSON.stringify({
+        fallback: true,
+        timestamp: record.timestamp,
+        tool_name: record.tool_name,
+        customer_id: record.customer_id,
+        operation_type: record.operation_type,
+        amount: record.amount,
+        currency: record.currency,
+        outcome: record.outcome,
+        risk_score: record.risk_score,
+        metadata: "[unserializable]",
+        audit_error: record.audit_error,
+      });
+    }
+    appendFileSync(join(config.dataDir, "audit-fallback.log"), `${line}\n`, "utf8");
+  } catch {
+    // Intentionally swallowed — writeAuditEntry must never throw.
   }
 }
 
@@ -114,7 +173,11 @@ export function queryAuditLog(filters: AuditFilters): AuditEntry[] {
   }
   if (filters.endDate !== undefined) {
     conditions.push("timestamp <= ?");
-    params.push(filters.endDate);
+    params.push(
+      /^\d{4}-\d{2}-\d{2}$/.test(filters.endDate)
+        ? `${filters.endDate}T23:59:59.999Z`
+        : filters.endDate,
+    );
   }
 
   const where =

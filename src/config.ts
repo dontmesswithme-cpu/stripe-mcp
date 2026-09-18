@@ -12,19 +12,57 @@ import { createHash } from "node:crypto";
 
 // ── Parsing helpers ─────────────────────────────────────────────────
 
-function envBool(key: string, fallback: boolean): boolean {
+function envBool(key: string, fallback: boolean, safeDirection = true): boolean {
   const val = process.env[key];
   if (val === undefined || val === "") return fallback;
-  return val === "true" || val === "1";
+  const normalized = val.trim().toLowerCase();
+  if (
+    normalized === "true" ||
+    normalized === "1" ||
+    normalized === "yes" ||
+    normalized === "on"
+  ) {
+    return true;
+  }
+  if (
+    normalized === "false" ||
+    normalized === "0" ||
+    normalized === "no" ||
+    normalized === "off"
+  ) {
+    return false;
+  }
+  // Fail-closed: unrecognized values resolve to the safe direction.
+  return safeDirection;
 }
 
-function envInt(key: string, fallback: number): number {
+function envInt(
+  key: string,
+  fallback: number,
+  opts?: { min?: number; max?: number },
+): number {
   const val = process.env[key];
   if (val === undefined || val === "") return fallback;
-  const parsed = parseInt(val, 10);
+  const trimmed = val.trim();
+  if (!/^-?\d+$/.test(trimmed)) {
+    throw new Error(
+      `Invalid integer for environment variable ${key}: "${val}"`,
+    );
+  }
+  const parsed = parseInt(trimmed, 10);
   if (Number.isNaN(parsed)) {
     throw new Error(
       `Invalid integer for environment variable ${key}: "${val}"`,
+    );
+  }
+  if (opts?.min !== undefined && parsed < opts.min) {
+    throw new Error(
+      `Environment variable ${key} out of range: got ${parsed}, expected >= ${opts.min}`,
+    );
+  }
+  if (opts?.max !== undefined && parsed > opts.max) {
+    throw new Error(
+      `Environment variable ${key} out of range: got ${parsed}, expected <= ${opts.max}`,
     );
   }
   return parsed;
@@ -56,6 +94,7 @@ export interface StripeMcpConfig {
   readonly approvalExpiryMinutes: number;
   readonly approvalRefundThreshold: number;
   readonly approvalCancelThreshold: number;
+  readonly approvalChargeThreshold: number;
 
   // ── Risk engine
   readonly riskAmountHigh: number;
@@ -71,6 +110,7 @@ export interface StripeMcpConfig {
   // ── Audit Pruning
   readonly auditRetentionDays: number;
   readonly auditPruneIntervalMs: number;
+  readonly executionRetentionDays: number;
 
   // ── Execution / reconciliation
   readonly executionStaleMinutes: number;
@@ -89,39 +129,57 @@ export interface StripeMcpConfig {
  * Frozen configuration object. Values are parsed from `process.env`
  * at module load time and never change.
  */
-export const config: StripeMcpConfig = {
+export const config: StripeMcpConfig = Object.freeze({
   // Core
-  readOnly: envBool("STRIPE_READ_ONLY", false),
-  dryRun: envBool("STRIPE_DRY_RUN", false),
+  readOnly: envBool("STRIPE_READ_ONLY", false, true),
+  dryRun: envBool("STRIPE_DRY_RUN", false, true),
   dataDir: envStr("STRIPE_MCP_DATA_DIR", "./data"),
 
   // Approval server
   approvalApiHash: envStrHashed("APPROVAL_API_KEY", ""),
-  approvalPort: envInt("APPROVAL_PORT", 3001),
-  approvalExpiryMinutes: envInt("APPROVAL_EXPIRY_MINUTES", 60),
-  approvalRefundThreshold: envInt("APPROVAL_REFUND_THRESHOLD", 100_000),
-  approvalCancelThreshold: envInt("APPROVAL_CANCEL_THRESHOLD", 500_000),
+  approvalPort: envInt("APPROVAL_PORT", 3001, { min: 0, max: 65535 }),
+  approvalExpiryMinutes: envInt("APPROVAL_EXPIRY_MINUTES", 60, { min: 1 }),
+  approvalRefundThreshold: envInt("APPROVAL_REFUND_THRESHOLD", 100_000, {
+    min: 0,
+  }),
+  approvalCancelThreshold: envInt("APPROVAL_CANCEL_THRESHOLD", 500_000, {
+    min: 0,
+  }),
+  approvalChargeThreshold: envInt("APPROVAL_CHARGE_THRESHOLD", 100_000, {
+    min: 0,
+  }),
 
   // Risk engine
-  riskAmountHigh: envInt("RISK_AMOUNT_HIGH", 50_000),
-  riskAmountCritical: envInt("RISK_AMOUNT_CRITICAL", 200_000),
-  riskBlockThreshold: envInt("RISK_BLOCK_THRESHOLD", 70),
-  riskFlagThreshold: envInt("RISK_FLAG_THRESHOLD", 40),
-  riskVelocity24hMax: envInt("RISK_VELOCITY_24H_MAX", 5),
-  riskVelocity30dMax: envInt("RISK_VELOCITY_30D_MAX", 20),
+  riskAmountHigh: envInt("RISK_AMOUNT_HIGH", 50_000, { min: 0 }),
+  riskAmountCritical: envInt("RISK_AMOUNT_CRITICAL", 200_000, { min: 0 }),
+  riskBlockThreshold: envInt("RISK_BLOCK_THRESHOLD", 70, { min: 0 }),
+  riskFlagThreshold: envInt("RISK_FLAG_THRESHOLD", 40, { min: 0 }),
+  riskVelocity24hMax: envInt("RISK_VELOCITY_24H_MAX", 5, { min: 0 }),
+  riskVelocity30dMax: envInt("RISK_VELOCITY_30D_MAX", 20, { min: 0 }),
 
   // Archive
-  archiveDeleteAfterDays: envInt("ARCHIVE_DELETE_AFTER_DAYS", 14),
+  archiveDeleteAfterDays: envInt("ARCHIVE_DELETE_AFTER_DAYS", 14, { min: 1 }),
 
   // Audit Pruning
-  auditRetentionDays: envInt("AUDIT_RETENTION_DAYS", 90),
-  auditPruneIntervalMs: envInt("AUDIT_PRUNE_INTERVAL_MS", 86_400_000),
+  auditRetentionDays: envInt("AUDIT_RETENTION_DAYS", 90, { min: 1 }),
+  auditPruneIntervalMs: envInt("AUDIT_PRUNE_INTERVAL_MS", 86_400_000, {
+    min: 1,
+  }),
+  executionRetentionDays: envInt("EXECUTION_RETENTION_DAYS", 30, { min: 1 }),
 
   // Execution / reconciliation
-  executionStaleMinutes: envInt("EXECUTION_STALE_MINUTES", 5),
-  reconciliationIntervalMs: envInt("RECONCILIATION_INTERVAL_MS", 60_000),
-  reconciliationRetryIntervalMs: envInt("RECONCILIATION_RETRY_INTERVAL_MS", 900_000),
-  reconciliationMaxAgeHours: envInt("RECONCILIATION_MAX_AGE_HOURS", 24),
-  stripeWriteConcurrency: envInt("STRIPE_WRITE_CONCURRENCY", 3),
-  stripeWriteIntervalMs: envInt("STRIPE_WRITE_INTERVAL_MS", 150),
-};
+  executionStaleMinutes: envInt("EXECUTION_STALE_MINUTES", 5, { min: 1 }),
+  reconciliationIntervalMs: envInt("RECONCILIATION_INTERVAL_MS", 60_000, {
+    min: 1,
+  }),
+  reconciliationRetryIntervalMs: envInt(
+    "RECONCILIATION_RETRY_INTERVAL_MS",
+    900_000,
+    { min: 1 },
+  ),
+  reconciliationMaxAgeHours: envInt("RECONCILIATION_MAX_AGE_HOURS", 24, {
+    min: 1,
+  }),
+  stripeWriteConcurrency: envInt("STRIPE_WRITE_CONCURRENCY", 3, { min: 1 }),
+  stripeWriteIntervalMs: envInt("STRIPE_WRITE_INTERVAL_MS", 150, { min: 1 }),
+});

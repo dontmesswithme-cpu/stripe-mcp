@@ -22,7 +22,21 @@ import {
 } from "../utils/errors.js";
 import type { McpToolResponse, OperationContext, RiskScore, ToolError } from "../types.js";
 import { logger } from "../utils/logger.js";
-import { createHash } from "node:crypto";
+
+// ── Test seam ────────────────────────────────────────────────────────
+// config is frozen at module load (by design). Tests that need to
+// exercise read-only / dry-run paths toggle this override instead of
+// mutating config. Production code never sets it.
+let policyOverride: { readOnly?: boolean } | undefined;
+
+/** TEST-ONLY: override frozen policy flags. Pass {} to clear. */
+export function __setPolicyOverrideForTests(override: { readOnly?: boolean }): void {
+  policyOverride = Object.keys(override).length > 0 ? override : undefined;
+}
+
+function isReadOnlyMode(): boolean {
+  return policyOverride?.readOnly ?? config.readOnly;
+}
 
 export async function executeStripeOperation<T>(
   context: OperationContext,
@@ -47,13 +61,15 @@ export async function executeStripeOperation<T>(
     };
   }
 
-  const scopePrefix = context.customerId
-    ? context.customerId
-    : createHash("sha256").update(JSON.stringify(context.params)).digest("hex").slice(0, 16);
+  // The raw UUID is the global deduplication key for both Stripe and the
+  // executions table. A customerId/params-hash scope prefix must NOT be
+  // prepended: the same raw UUID reused with different params (or a
+  // different customer) would produce a different scoped key, bypass the
+  // UNIQUE idx_executions_idemp_key lookup, and execute twice. The stored
+  // request_hash distinguishes an exact retry from a param-mismatched reuse.
+  const idempotencyKey = rawIdempotencyKey;
 
-  const idempotencyKey = `${scopePrefix}:${rawIdempotencyKey}`;
-
-  if (config.readOnly) {
+  if (isReadOnlyMode()) {
     await writeAuditEntry(context, "blocked", null, {
       reason: "read_only_mode",
       idempotency_key: idempotencyKey,
@@ -105,7 +121,15 @@ export async function executeStripeOperation<T>(
       try {
         riskResult = await scoreRisk(context);
       } catch (error) {
-        return toErrorResponse(error);
+        // Fail-closed with a trail: risk evaluation failed, so the
+        // operation does not proceed. Never throws (audit is best-effort).
+        const errorResponse = toErrorResponse(error);
+        await writeAuditEntry(context, "error", null, {
+          risk_scoring_failed: true,
+          idempotency_key: idempotencyKey,
+          error: toolErrorFromResponse(errorResponse) ?? { code: "unknown" },
+        });
+        return errorResponse;
       }
       const block = await checkRiskBlock(context, riskResult);
       if (block) return block;
@@ -144,7 +168,15 @@ export async function executeStripeOperation<T>(
     try {
       riskResult = await scoreRisk(context);
     } catch (error) {
-      return toErrorResponse(error);
+      // Fail-closed with a trail: risk evaluation failed, so the
+      // operation does not proceed. Never throws (audit is best-effort).
+      const errorResponse = toErrorResponse(error);
+      await writeAuditEntry(context, "error", null, {
+        risk_scoring_failed: true,
+        idempotency_key: idempotencyKey,
+        error: toolErrorFromResponse(errorResponse) ?? { code: "unknown" },
+      });
+      return errorResponse;
     }
     const block = await checkRiskBlock(context, riskResult);
     if (block) return block;
@@ -171,8 +203,15 @@ export async function executeStripeOperation<T>(
     ? (context.params.approval_token as string)
     : null;
 
+  // reconcileParams is the Stripe body replayed by the reconciler. Both
+  // control-plane fields live in dedicated executions columns
+  // (executions.idempotency_key, executions.approval_token) and must never
+  // leak into the Stripe body — e.g. create_refund / create_payment_intent
+  // reject unknown params. Regression guard: idempotency_key was previously
+  // left in, so replay sent it both as header (RequestOptions) and body field.
   const reconcileParams = { ...context.params };
   delete (reconcileParams as { approval_token?: string }).approval_token;
+  delete (reconcileParams as { idempotency_key?: string }).idempotency_key;
 
   const begun = await beginExecution(
     approvalToken,
@@ -244,6 +283,7 @@ export async function executeStripeOperation<T>(
 
     await writeAuditEntry(context, "error", riskResult?.total ?? null, {
       error: lastError ?? { code: "unknown" },
+      idempotency_key: idempotencyKey,
     });
 
     return errorResponse;
@@ -292,6 +332,19 @@ function shouldRequireApproval(
     return true;
   }
 
+  // Charge-like money movement: creating/collecting funds (payment
+  // intents, invoice payments, subscriptions, prices) and updating
+  // subscriptions (adding items, upgrading price, proration can charge).
+  // Only fires when the tool resolved a real amount into context —
+  // non-monetary creates/updates (customers, catalog products,
+  // metadata-only subscription updates with amount 0/undefined) skip.
+  if (
+    (op === "pay" || op === "confirm" || op === "create" || op === "update") &&
+    amount >= config.approvalChargeThreshold
+  ) {
+    return true;
+  }
+
   if (
     context.capability.approvalEligible &&
     context.capability.riskScored &&
@@ -312,10 +365,10 @@ function policyError(code: string, message: string): McpToolResponse<never> {
 }
 
 function consumeFailureToResponse(
-  reason: ConsumeApprovalFailure | "duplicate_in_flight" | "already_completed",
+  reason: ConsumeApprovalFailure | "duplicate_in_flight" | "already_completed" | "unknown_outcome_pending" | "idempotency_key_mismatch",
 ): McpToolResponse<never> {
   const map: Record<
-    ConsumeApprovalFailure | "duplicate_in_flight" | "already_completed",
+    ConsumeApprovalFailure | "duplicate_in_flight" | "already_completed" | "unknown_outcome_pending" | "idempotency_key_mismatch",
     ToolError
   > = {
     not_found: {
@@ -355,6 +408,19 @@ function consumeFailureToResponse(
       type: "policy_error",
       message:
         "An execution with this idempotency_key has already been processed.",
+    },
+    unknown_outcome_pending: {
+      code: "unknown_outcome_pending",
+      type: "policy_error",
+      message:
+        "previous attempt outcome unknown - reconciliation in progress; do not assume success.",
+    },
+    idempotency_key_mismatch: {
+      code: "idempotency_key_mismatch",
+      type: "policy_error",
+      message:
+        "This idempotency_key was already used with different request parameters. " +
+        "Generate a new idempotency_key for a new operation; reuse a key only for exact retries.",
     },
   };
 

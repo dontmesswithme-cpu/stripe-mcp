@@ -1,8 +1,9 @@
-import { startApprovalServer, stopApprovalServer } from "../src/approval/server.js";
 import http from "node:http";
 import crypto from "node:crypto";
 
 // We set env vars programmatically before starting the server so config reads them
+// NOTE: must be set before dynamically importing the server (see runTest),
+// because ESM static imports are hoisted and config.ts is evaluated at import time.
 process.env.APPROVAL_PORT = "3002";
 process.env.APPROVAL_API_KEY = "test-key";
 
@@ -33,6 +34,12 @@ function makeRequest(path: string): Promise<{ statusCode: number; body: string }
 }
 
 async function runTest() {
+  // Dynamic import AFTER env vars are set: static imports are hoisted in ESM,
+  // which would evaluate src/config.ts before the env vars above take effect
+  // (leaving approvalApiHash empty and the server disabled). Awaiting the
+  // import here guarantees config sees APPROVAL_PORT/APPROVAL_API_KEY.
+  const { startApprovalServer, stopApprovalServer } = await import("../src/approval/server.js");
+
   const server = startApprovalServer();
   if (!server) {
     console.error("FAIL: Server failed to start");

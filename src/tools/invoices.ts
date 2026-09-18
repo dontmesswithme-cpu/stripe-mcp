@@ -12,6 +12,7 @@ import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
 import { executeStripeOperation } from "../middleware/execute.js";
+import { resolveInvoicePaymentCents } from "../utils/stripe-amounts.js";
 import type {
   ToolCapability,
   ListInvoicesInput,
@@ -94,8 +95,8 @@ const payInvoiceCapability: ToolCapability = {
   tool: "pay_invoice",
   operation: "pay",
   readOnly: false,
-  riskScored: false,
-  approvalEligible: false,
+  riskScored: true,
+  approvalEligible: true,
 };
 
 /**
@@ -124,12 +125,22 @@ const payInvoiceCapability: ToolCapability = {
 export async function payInvoice(
   input: PayInvoiceInput,
 ): Promise<McpToolResponse<Stripe.Invoice>> {
+  // Resolve the collectible amount first so risk scoring and approval
+  // thresholds gate the real charge — including forgive:true write-offs.
+  // Retrieve errors fail closed via a structured error (no execution).
+  let resolved: { amount: number; currency?: string; customerId?: string };
+  try {
+    resolved = await resolveInvoicePaymentCents(input.invoice_id);
+  } catch (error: unknown) {
+    return toErrorResponse(error);
+  }
+
   return executeStripeOperation(
     {
       capability: payInvoiceCapability,
-      customerId: undefined,
-      amount: undefined,
-      currency: undefined,
+      customerId: resolved.customerId,
+      amount: resolved.amount,
+      currency: resolved.currency,
       params: input as Record<string, unknown>,
     },
     (options) => {

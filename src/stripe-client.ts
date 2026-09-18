@@ -56,14 +56,14 @@ if (!apiKey || apiKey.trim().length === 0) {
  * - Configures automatic retries (2) with exponential back-off.
  * - Identifies as `stripe-mcp` for Stripe's internal request logs.
  */
-export const stripe = new Stripe(apiKey, {
+export const stripe = new Stripe(apiKey.trim(), {
   apiVersion: STRIPE_API_VERSION,
   typescript: true,
   maxNetworkRetries: 2,
   appInfo: {
     name: "stripe-mcp",
     url: "https://github.com/stripe-mcp/stripe-mcp",
-    version: "0.1.0",
+    version: "1.1.0",
   },
 });
 

@@ -1,10 +1,13 @@
 import { parentPort } from "node:worker_threads";
-import { initializeAllDatabases, closeAllDatabases, getApprovalsDb } from "../../utils/db.js";
+import { initializeAllDatabases, closeAllDatabases, getApprovalsDb, getAuditDb } from "../../utils/db.js";
 import * as auditLog from "../../audit/log.worker.js";
 import * as approvalStore from "../../approval/store.worker.js";
 import * as executionStore from "../../execution/store.worker.js";
 import * as pruneLog from "../../audit/prune.worker.js";
 
+// Handlers are DB-side functions invoked positionally over the worker
+// boundary; their (already loose) signatures are unified here on purpose.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 const handlers: Record<string, Function> = {
   initializeAllDatabases,
   closeAllDatabases,
@@ -24,8 +27,13 @@ const handlers: Record<string, Function> = {
   findUnknownOutcomes: executionStore.findUnknownOutcomes,
   sweepStaleExecutions: executionStore.sweepStaleExecutions,
   pruneAuditLog: pruneLog.pruneAuditLog,
-  testQuery: (sql: string, ...params: any[]) => {
+  testQuery: (sql: string, ...params: unknown[]) => {
     const stmt = getApprovalsDb().prepare(sql);
+    return stmt.reader ? stmt.all(...params) : stmt.run(...params);
+  },
+  // Test-only mirror of testQuery against the audit database.
+  testAuditQuery: (sql: string, ...params: unknown[]) => {
+    const stmt = getAuditDb().prepare(sql);
     return stmt.reader ? stmt.all(...params) : stmt.run(...params);
   },
 };
@@ -39,9 +47,17 @@ if (!parentPort) {
   throw new Error("db.worker.ts must be run as a worker thread");
 }
 
-parentPort.on("message", async (msg: any) => {
+interface WorkerMessage {
+  id?: number;
+  method?: string;
+  args?: unknown[];
+  type?: string;
+  cancelId?: number;
+}
+
+parentPort.on("message", async (msg: WorkerMessage) => {
   if (msg.type === "cancel") {
-    cancelledOps.add(msg.cancelId);
+    cancelledOps.add(msg.cancelId as number);
     return;
   }
 
@@ -64,7 +80,9 @@ parentPort.on("message", async (msg: any) => {
       isCancelled: () => cancelledOps.has(id),
     };
 
-    const result = await executionContext.run(ctx, () => handler(...args));
+    const result = await executionContext.run(ctx, () =>
+      handler(...(args ?? [])),
+    );
 
     if (cancelledOps.has(id)) {
       cancelledOps.delete(id);

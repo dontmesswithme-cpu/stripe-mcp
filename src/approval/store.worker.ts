@@ -4,9 +4,13 @@
  * SQLite-backed approval token CRUD.
  */
 
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { getApprovalsDb } from "../utils/db.js";
 import { config } from "../config.js";
+import { canonicalize, computeRequestHash } from "../utils/hash.js";
+// Re-export canonical hash helpers (single source of truth in utils/hash.ts)
+// so existing importers of store.worker.js keep working.
+export { canonicalize, computeRequestHash };
 import type {
   ApprovalToken,
   OperationContext,
@@ -49,42 +53,6 @@ export type ConsumeApprovalResult =
   | { readonly ok: false; readonly reason: ConsumeApprovalFailure };
 
 // ── Public API ──────────────────────────────────────────────────────
-
-export function canonicalize(obj: unknown, depth = 0): unknown {
-  if (depth > 10) {
-    throw new Error("Validation Error: Maximum payload depth exceeded during canonicalization");
-  }
-  if (obj === null || typeof obj !== "object") {
-    return obj;
-  }
-  if (Array.isArray(obj)) {
-    return obj.map((item) => canonicalize(item, depth + 1));
-  }
-  const keys = Object.keys(obj as Record<string, unknown>).sort();
-  const result: Record<string, unknown> = {};
-  for (const key of keys) {
-    const value = (obj as Record<string, unknown>)[key];
-    if (key === "approval_token" || value === undefined) continue;
-    result[key] = canonicalize(value, depth + 1);
-  }
-  return result;
-}
-
-export function computeRequestHash(context: OperationContext): string {
-  const { capability, params } = context;
-  const canonicalParams = canonicalize(params);
-  const idempotencyKey = String(params.idempotency_key ?? "");
-
-  return createHash("sha256")
-    .update(capability.tool)
-    .update("|")
-    .update(capability.operation)
-    .update("|")
-    .update(idempotencyKey)
-    .update("|")
-    .update(JSON.stringify(canonicalParams))
-    .digest("hex");
-}
 
 export function createApproval(
   context: OperationContext,

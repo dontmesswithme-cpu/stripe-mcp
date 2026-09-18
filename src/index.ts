@@ -3,7 +3,7 @@
 /**
  * @module stripe-mcp
  *
- * Entry point for the Stripe MCP server (v1.0.0).
+ * Entry point for the Stripe MCP server (v1.1.0).
  *
  * - Validates required environment variables at startup.
  * - Initializes SQLite databases for audit logging and approvals.
@@ -27,7 +27,7 @@ import "./stripe-client.js";
 // ── Infrastructure ──────────────────────────────────────────────────
 import { config } from "./config.js";
 import { runDbOp, shutdownDbWorker } from "./worker/db/db.client.js";
-import { startApprovalServer, stopApprovalServer } from "./approval/server.js";
+import { startApprovalServer, stopApprovalServer, whenApprovalServerReady } from "./approval/server.js";
 import {
   startReconciliationLoop,
   stopReconciliationLoop,
@@ -468,7 +468,17 @@ async function main(): Promise<void> {
   }
 
   if (config.approvalPort > 0 && config.approvalApiHash) {
-    logger.info({ port: config.approvalPort }, "APPROVALS: HTTP Server listening");
+    // Await the actual bind outcome — activeServer is only set in the
+    // async "listening" callback, so a sync check here would race.
+    const listening = await whenApprovalServerReady();
+    if (listening) {
+      logger.info({ port: config.approvalPort }, "APPROVALS: HTTP Server listening");
+    } else {
+      logger.error(
+        { port: config.approvalPort },
+        "APPROVALS: Server failed to bind — approvals disabled. Check port conflicts (EADDRINUSE).",
+      );
+    }
   } else {
     logger.warn("APPROVALS: Server disabled (APPROVAL_PORT=0 or APPROVAL_API_KEY missing)");
   }

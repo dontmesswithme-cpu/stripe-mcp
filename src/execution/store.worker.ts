@@ -45,7 +45,9 @@ interface RawExecutionRow {
 export type BeginExecutionFailureReason =
   | ConsumeApprovalFailure
   | "duplicate_in_flight"
-  | "already_completed";
+  | "already_completed"
+  | "unknown_outcome_pending"
+  | "idempotency_key_mismatch";
 
 export type BeginExecutionResult =
   | { readonly ok: true; readonly executionId: string }
@@ -120,12 +122,18 @@ export function beginExecution(
   checkCancel();
   const existing = db
     .prepare(
-      `SELECT execution_id, status FROM executions
+      `SELECT execution_id, status, request_hash FROM executions
        WHERE idempotency_key = ?`
     )
-    .get(idempotencyKey) as { execution_id: string; status: string } | undefined;
+    .get(idempotencyKey) as { execution_id: string; status: string; request_hash: string } | undefined;
 
   if (existing !== undefined) {
+    if (existing.request_hash !== requestHash) {
+      return { ok: false, reason: "idempotency_key_mismatch" };
+    }
+    if (existing.status === 'unknown_outcome') {
+      return { ok: false, reason: "unknown_outcome_pending" };
+    }
     if (existing.status === 'executing') {
       return { ok: false, reason: "duplicate_in_flight" };
     } else {
@@ -159,7 +167,13 @@ export function beginExecution(
     })();
   } catch (error: unknown) {
     if (isSqliteUniqueConstraint(error)) {
-      const existing = db.prepare("SELECT status FROM executions WHERE idempotency_key = ?").get(idempotencyKey) as { status: string } | undefined;
+      const existing = db.prepare("SELECT status, request_hash FROM executions WHERE idempotency_key = ?").get(idempotencyKey) as { status: string; request_hash: string } | undefined;
+      if (existing && existing.request_hash !== requestHash) {
+        return { ok: false, reason: "idempotency_key_mismatch" };
+      }
+      if (existing && existing.status === 'unknown_outcome') {
+        return { ok: false, reason: "unknown_outcome_pending" };
+      }
       if (existing && existing.status !== 'executing') {
         return { ok: false, reason: "already_completed" };
       }
@@ -240,6 +254,9 @@ export function findUnknownOutcomes(): ExecutionRecord[] {
 
 /**
  * Mark stale in-flight executions as unknown (crash / hung worker).
+ *
+ * Excludes purge_expired_customers: purges are non-replayable bulk deletes
+ * and must never be flipped to unknown_outcome for reconciliation retry.
  */
 export function sweepStaleExecutions(): number {
   const db = getApprovalsDb();
@@ -251,7 +268,8 @@ export function sweepStaleExecutions(): number {
   const result = db.prepare(
     `UPDATE executions
      SET status = 'unknown_outcome', completed_at = COALESCE(completed_at, ?)
-     WHERE status = 'executing' AND started_at < ?`,
+     WHERE status = 'executing' AND started_at < ?
+       AND reconcile_tool != 'purge_expired_customers'`,
   ).run(new Date().toISOString(), cutoff);
 
   return result.changes;

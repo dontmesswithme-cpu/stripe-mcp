@@ -52,12 +52,23 @@ export async function replayStripeMutation(
   }
 }
 
+/** TEST-ONLY: direct access to the replay dispatcher for regression tests. */
+export const dispatchReplayForTest = dispatchReplay;
+
 async function dispatchReplay(
   tool: string,
   operation: OperationType,
   params: Record<string, unknown>,
   idempotencyKey: string,
 ): Promise<unknown> {
+  // Defensive: strip control-plane fields that live in executions columns,
+  // not the Stripe body. Covers legacy rows written before execute.ts
+  // stripped idempotency_key, plus any future caller passing raw params.
+  // Regression guard: create_refund / create_payment_intent bodies must
+  // contain neither approval_token nor idempotency_key — the key travels
+  // only as RequestOptions.idempotencyKey (header), never as a body field.
+  delete (params as { approval_token?: unknown }).approval_token;
+  delete (params as { idempotency_key?: unknown }).idempotency_key;
   const opts: Stripe.RequestOptions = { idempotencyKey };
 
   switch (tool) {
@@ -102,6 +113,9 @@ async function dispatchReplay(
     }
 
     case "create_payment_intent":
+      // Regression: body must contain neither approval_token nor
+      // idempotency_key (both stripped above) — Stripe would reject them as
+      // unknown params; idempotency travels only via opts.
       return stripe.paymentIntents.create(
         params as unknown as Stripe.PaymentIntentCreateParams,
         opts,
@@ -178,6 +192,9 @@ async function dispatchReplay(
     }
 
     case "create_refund":
+      // Regression: body must contain neither approval_token nor
+      // idempotency_key (both stripped above) — Stripe would reject them as
+      // unknown params; idempotency travels only via opts.
       return stripe.refunds.create(
         params as unknown as Stripe.RefundCreateParams,
         opts,

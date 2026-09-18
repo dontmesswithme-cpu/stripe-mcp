@@ -4,9 +4,19 @@ import { logger } from "../../utils/logger.js";
 
 const __filename = fileURLToPath(import.meta.url);
 
+interface PendingRequest {
+  resolve: (val: unknown) => void;
+  reject: (err: Error) => void;
+}
+
 let worker: Worker | null = null;
 let messageIdCounter = 0;
-const pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: Error) => void }>();
+const pendingRequests = new Map<number, PendingRequest>();
+// Set only around the deliberate terminate() in shutdownDbWorker so the
+// expected non-zero exit from terminate() is not misreported as a crash.
+// (Deliberately minimal: terminate() exit codes are async and cannot be
+// distinguished from real crashes without this flag.)
+let expectWorkerExit = false;
 
 export function getDbWorker(): Worker {
   if (!worker) {
@@ -21,7 +31,7 @@ export function getDbWorker(): Worker {
     const currentWorker = new Worker(workerFile, { execArgv });
     worker = currentWorker;
 
-    currentWorker.on("message", (msg: { id: number; result?: any; error?: string; ok: boolean }) => {
+    currentWorker.on("message", (msg: { id: number; result?: unknown; error?: string; ok: boolean }) => {
       const { id, result, error, ok } = msg;
       const req = pendingRequests.get(id);
       if (req) {
@@ -34,19 +44,29 @@ export function getDbWorker(): Worker {
       }
     });
 
-    const handleCrash = (reason: any) => {
+    const handleCrash = (reason: unknown) => {
       if (worker !== currentWorker) return; // Ignore if this is an old worker emitting exit after error
       logger.error({ reason }, "DB worker crashed or stopped unexpectedly");
       for (const req of pendingRequests.values()) {
         req.reject(new Error("Worker crashed"));
       }
       pendingRequests.clear();
+      // NOTE: deliberately no terminate() here. Terminating an errored
+      // worker thread mid-flight correlated with better-sqlite3 native
+      // crashes (V8 fatal in pragma) on Windows in worker.test; the
+      // orphaned-thread leak (#19) is the lesser evil until better-sqlite3
+      // is upgraded. See Phase3 notes.
       worker = null;
     };
 
     currentWorker.on("error", handleCrash);
 
     currentWorker.on("exit", (code) => {
+      if (worker !== currentWorker) return;
+      if (expectWorkerExit) {
+        logger.info({ code }, "DB worker exited (intentional shutdown)");
+        return;
+      }
       if (code !== 0) {
         handleCrash(code);
       }
@@ -55,11 +75,14 @@ export function getDbWorker(): Worker {
   return worker;
 }
 
-export function runDbOp<T>(method: string, ...args: any[]): Promise<T> {
+export function runDbOp<T>(method: string, ...args: unknown[]): Promise<T> {
   const id = ++messageIdCounter;
   
   const workerPromise = new Promise<T>((resolve, reject) => {
-    pendingRequests.set(id, { resolve, reject });
+    pendingRequests.set(id, {
+      resolve: resolve as (val: unknown) => void,
+      reject,
+    });
     getDbWorker().postMessage({ id, method, args });
   });
 
@@ -80,7 +103,15 @@ export function runDbOp<T>(method: string, ...args: any[]): Promise<T> {
 export async function shutdownDbWorker(): Promise<void> {
   if (worker) {
     await runDbOp("closeAllDatabases");
-    await worker.terminate();
-    worker = null;
+    const current = worker;
+    expectWorkerExit = true;
+    try {
+      await current.terminate();
+    } finally {
+      expectWorkerExit = false;
+      if (worker === current) {
+        worker = null;
+      }
+    }
   }
 }

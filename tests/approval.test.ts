@@ -16,10 +16,12 @@ import {
 } from "../src/execution/store.js";
 import { WORKER_ID } from "../src/worker/identity.js";
 import { runDbOp, shutdownDbWorker } from "../src/worker/db/db.client.js";
-import { executeStripeOperation } from "../src/middleware/execute.js";
+import {
+  executeStripeOperation,
+  __setPolicyOverrideForTests,
+} from "../src/middleware/execute.js";
 import { reconcileUnknownOutcomes } from "../src/reconciliation/worker.js";
 import { stripe } from "../src/stripe-client.js";
-import { config } from "../src/config.js";
 
 describe("Decoupled Execution & Approval Architecture", () => {
   beforeAll(async () => {
@@ -27,6 +29,7 @@ describe("Decoupled Execution & Approval Architecture", () => {
   });
 
   afterAll(async () => {
+    __setPolicyOverrideForTests({}); // safety net: never leak overrides
     await shutdownDbWorker();
     try {
       rmSync(process.env.STRIPE_MCP_DATA_DIR!, {
@@ -339,31 +342,32 @@ describe("Decoupled Execution & Approval Architecture", () => {
   });
 
   it("STRIPE_READ_ONLY blocks mutations", async () => {
-    const origReadOnly = config.readOnly;
-    config.readOnly = true;
+    __setPolicyOverrideForTests({ readOnly: true });
 
-    const result = await executeStripeOperation(
-      {
-        capability: {
-          tool: "test_tool",
-          operation: "create",
-          readOnly: false,
-          riskScored: false,
-          approvalEligible: false,
+    try {
+      const result = await executeStripeOperation(
+        {
+          capability: {
+            tool: "test_tool",
+            operation: "create",
+            readOnly: false,
+            riskScored: false,
+            approvalEligible: false,
+          },
+          params: {
+            idempotency_key: "550e8400-e29b-41d4-a716-446655440099",
+          },
         },
-        params: {
-          idempotency_key: "550e8400-e29b-41d4-a716-446655440099",
-        },
-      },
-      async () => ({ id: "blocked" }),
-    );
+        async () => ({ id: "blocked" }),
+      );
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error.code).toBe("read_only");
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.code).toBe("read_only");
+      }
+    } finally {
+      __setPolicyOverrideForTests({});
     }
-
-    config.readOnly = origReadOnly;
   });
 });
 

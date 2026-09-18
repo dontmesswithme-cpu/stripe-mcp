@@ -21,7 +21,7 @@ export function canonicalize(obj: unknown, depth = 0): unknown {
   const result: Record<string, unknown> = {};
   for (const key of keys) {
     const value = (obj as Record<string, unknown>)[key];
-    if (key === "approval_token" || value === undefined) continue;
+    if ((key === "approval_token" && depth === 0) || value === undefined) continue;
     result[key] = canonicalize(value, depth + 1);
   }
   return result;

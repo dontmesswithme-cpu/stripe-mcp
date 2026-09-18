@@ -75,9 +75,9 @@ export async function createRefund(
     };
   }
 
-  let refundAmount: number;
+  let resolved: { amount: number; currency?: string; customerId?: string };
   try {
-    refundAmount = await resolveRefundAmountCents(input);
+    resolved = await resolveRefundAmountCents(input);
   } catch (error: unknown) {
     return toErrorResponse(error);
   }
@@ -85,9 +85,9 @@ export async function createRefund(
   return executeStripeOperation(
     {
       capability: createRefundCapability,
-      customerId: undefined,
-      amount: refundAmount,
-      currency: undefined,
+      customerId: resolved.customerId,
+      amount: resolved.amount,
+      currency: resolved.currency,
       params: input as Record<string, unknown>,
     },
     (options) =>

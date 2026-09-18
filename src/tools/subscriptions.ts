@@ -12,7 +12,8 @@ import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
 import { executeStripeOperation } from "../middleware/execute.js";
-import { resolveSubscriptionValueCents } from "../utils/stripe-amounts.js";
+import { resolveSubscriptionValueCents, resolveSubscriptionItemsValueCents } from "../utils/stripe-amounts.js";
+import type { ResolvedMoney } from "../utils/stripe-amounts.js";
 import type {
   CancelSubscriptionInput,
   CreateSubscriptionInput,
@@ -31,8 +32,8 @@ const createSubscriptionCapability: ToolCapability = {
   tool: "create_subscription",
   operation: "create",
   readOnly: false,
-  riskScored: false,
-  approvalEligible: false,
+  riskScored: true,
+  approvalEligible: true,
 };
 
 /**
@@ -53,18 +54,28 @@ const createSubscriptionCapability: ToolCapability = {
 export async function createSubscription(
   input: CreateSubscriptionInput,
 ): Promise<McpToolResponse<Stripe.Subscription>> {
+  // Resolve the per-period value of the requested price items so risk
+  // scoring and approval thresholds gate the recurring commitment.
+  // Price lookup errors fail closed via a structured error.
+  let resolved: { amount: number; currency?: string };
+  try {
+    resolved = await resolveSubscriptionItemsValueCents(input.items ?? []);
+  } catch (error: unknown) {
+    return toErrorResponse(error);
+  }
+
   return executeStripeOperation(
     {
       capability: createSubscriptionCapability,
       customerId: input.customer,
-      amount: undefined,
-      currency: undefined,
+      amount: resolved.amount,
+      currency: resolved.currency,
       params: input as Record<string, unknown>,
     },
     (options) =>
       stripe.subscriptions.create({
         customer: input.customer,
-        items: input.items?.map((item: any) => ({
+        items: input.items?.map((item) => ({
           price: item.price,
           quantity: item.quantity,
         })),
@@ -114,8 +125,8 @@ const updateSubscriptionCapability: ToolCapability = {
   tool: "update_subscription",
   operation: "update",
   readOnly: false,
-  riskScored: false,
-  approvalEligible: false,
+  riskScored: true,
+  approvalEligible: true,
 };
 
 /**
@@ -135,12 +146,119 @@ const updateSubscriptionCapability: ToolCapability = {
 export async function updateSubscription(
   input: UpdateSubscriptionInput,
 ): Promise<McpToolResponse<Stripe.Subscription>> {
+  // Gate money movement: adding items, upgrading price, or mid-cycle
+  // proration can charge the customer. Resolve the projected per-period
+  // total (after applying the requested item changes) plus customer and
+  // currency so risk scoring and approval thresholds see the real value.
+  // Metadata-only / cancel_at_period_end-only updates (no `items`) carry
+  // amount 0 and pass charge thresholds without over-gating.
+  // Any lookup failure fails closed via a structured error (no execution).
+  let resolvedAmount = 0;
+  let resolvedCurrency: string | undefined;
+  let resolvedCustomerId: string | undefined;
+  try {
+    const existing = await stripe.subscriptions.retrieve(input.subscription_id, {
+      expand: ["items.data.price"],
+    });
+
+    const cust = existing.customer;
+    resolvedCustomerId =
+      typeof cust === "string"
+        ? cust
+        : cust !== null &&
+            cust !== undefined &&
+            typeof cust === "object" &&
+            "id" in cust &&
+            typeof (cust as { id: unknown }).id === "string"
+          ? (cust as { id: string }).id
+          : undefined;
+
+    // Fallback currency from the existing subscription items (first price
+    // that reports one), or the subscription-level currency when present.
+    let existingCurrency: string | undefined;
+    if (
+      typeof (existing as unknown as { currency?: unknown }).currency ===
+      "string"
+    ) {
+      existingCurrency = (existing as unknown as { currency: string }).currency;
+    }
+    for (const item of existing.items.data) {
+      const p = item.price;
+      if (typeof p !== "string" && p.currency) {
+        existingCurrency = p.currency;
+        break;
+      }
+    }
+
+    if (input.items === undefined || input.items.length === 0) {
+      resolvedAmount = 0;
+      resolvedCurrency = existingCurrency;
+    } else {
+      // Build the projected item set: start from existing items, apply
+      // adds (no id), updates (id + new price/quantity), and deletes
+      // (id + deleted:true), then resolve the merged total. Reuses the
+      // resolveSubscriptionItemsValueCents price-lookup pattern so tiered/
+      // metered prices (null unit_amount) fail closed via a thrown error.
+      const projected = new Map<string, { price: string; quantity: number }>();
+      for (const item of existing.items.data) {
+        const priceId =
+          typeof item.price === "string" ? item.price : item.price.id;
+        projected.set(item.id, {
+          price: priceId,
+          quantity: item.quantity ?? 1,
+        });
+      }
+
+      input.items.forEach((req, index) => {
+        if (req.deleted === true) {
+          if (req.id !== undefined) {
+            if (!projected.has(req.id)) {
+              throw new Error(`Unknown subscription item id: ${req.id}`);
+            }
+            projected.delete(req.id);
+          }
+          return;
+        }
+        if (req.id !== undefined) {
+          const prev = projected.get(req.id);
+          if (prev === undefined) {
+            throw new Error(`Unknown subscription item id: ${req.id}`);
+          }
+          projected.set(req.id, {
+            price: req.price ?? prev?.price ?? "",
+            quantity: req.quantity ?? prev?.quantity ?? 1,
+          });
+          return;
+        }
+        projected.set(`__new_${index}`, {
+          price: req.price,
+          quantity: req.quantity ?? 1,
+        });
+      });
+
+      const projectedItems = [...projected.values()].filter(
+        (entry) => entry.price !== "",
+      );
+      if (projectedItems.length === 0) {
+        resolvedAmount = 0;
+        resolvedCurrency = existingCurrency;
+      } else {
+        const resolved =
+          await resolveSubscriptionItemsValueCents(projectedItems);
+        resolvedAmount = resolved.amount;
+        resolvedCurrency = resolved.currency ?? existingCurrency;
+      }
+    }
+  } catch (error: unknown) {
+    return toErrorResponse(error);
+  }
+
   return executeStripeOperation(
     {
       capability: updateSubscriptionCapability,
-      customerId: undefined,
-      amount: undefined,
-      currency: undefined,
+      customerId: resolvedCustomerId,
+      amount: resolvedAmount,
+      currency: resolvedCurrency,
       params: input as Record<string, unknown>,
     },
     (options) => {
@@ -205,9 +323,12 @@ const cancelSubscriptionCapability: ToolCapability = {
 export async function cancelSubscription(
   input: CancelSubscriptionInput,
 ): Promise<McpToolResponse<Stripe.Subscription>> {
-  let subscriptionValue: number;
+  // Resolve per-period value + customer + currency from the live
+  // subscription so velocity and customer risk factors are evaluated.
+  // Retrieve errors fail closed via a structured error.
+  let resolved: ResolvedMoney;
   try {
-    subscriptionValue = await resolveSubscriptionValueCents(
+    resolved = await resolveSubscriptionValueCents(
       input.subscription_id,
     );
   } catch (error: unknown) {
@@ -217,9 +338,9 @@ export async function cancelSubscription(
   return executeStripeOperation(
     {
       capability: cancelSubscriptionCapability,
-      customerId: undefined,
-      amount: subscriptionValue,
-      currency: undefined,
+      customerId: resolved.customerId,
+      amount: resolved.amount,
+      currency: resolved.currency,
       params: input as Record<string, unknown>,
     },
     async (options) => {

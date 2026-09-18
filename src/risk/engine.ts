@@ -255,14 +255,8 @@ async function checkCustomerFactors(
     // Deleted customers can't be scored further
     if ("deleted" in result && result.deleted) return;
     customer = result as Stripe.Customer;
-  } catch (error: any) {
-    if (
-      error?.statusCode === 429 ||
-      (error?.statusCode && error.statusCode >= 500) ||
-      error?.type === "StripeRateLimitError" ||
-      error?.type === "StripeAPIError" ||
-      error?.type === "StripeConnectionError"
-    ) {
+  } catch (error) {
+    if (isTransientStripeError(error)) {
       throw new Error("Service Unavailable");
     }
     // Customer lookup failed — enforce fail-closed policy
@@ -334,14 +328,8 @@ async function checkRefundRatio(
         points: 15,
       });
     }
-  } catch (error: any) {
-    if (
-      error?.statusCode === 429 ||
-      (error?.statusCode && error.statusCode >= 500) ||
-      error?.type === "StripeRateLimitError" ||
-      error?.type === "StripeAPIError" ||
-      error?.type === "StripeConnectionError"
-    ) {
+  } catch (error) {
+    if (isTransientStripeError(error)) {
       throw new Error("Service Unavailable");
     }
     // Charge lookup failed — enforce fail-closed policy
@@ -351,4 +339,21 @@ async function checkRefundRatio(
       points: config.riskBlockThreshold,
     });
   }
+}
+
+/**
+ * True for Stripe errors that are transient (rate limit / 5xx / network):
+ * the risk engine rethrows these as "Service Unavailable" so callers fail
+ * closed instead of treating the operation as permanently un-scoreable.
+ */
+function isTransientStripeError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const e = error as { statusCode?: unknown; type?: unknown };
+  return (
+    e.statusCode === 429 ||
+    (typeof e.statusCode === "number" && e.statusCode >= 500) ||
+    e.type === "StripeRateLimitError" ||
+    e.type === "StripeAPIError" ||
+    e.type === "StripeConnectionError"
+  );
 }

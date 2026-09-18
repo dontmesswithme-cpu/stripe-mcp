@@ -12,6 +12,7 @@ import type Stripe from "stripe";
 import { stripe } from "../stripe-client.js";
 import { toErrorResponse } from "../utils/errors.js";
 import { executeStripeOperation } from "../middleware/execute.js";
+import { resolvePaymentIntentValueCents } from "../utils/stripe-amounts.js";
 import type {
   CancelPaymentIntentInput,
   ConfirmPaymentIntentInput,
@@ -30,8 +31,8 @@ const createPaymentIntentCapability: ToolCapability = {
   tool: "create_payment_intent",
   operation: "create",
   readOnly: false,
-  riskScored: false,
-  approvalEligible: false,
+  riskScored: true,
+  approvalEligible: true,
 };
 
 /**
@@ -112,8 +113,8 @@ const confirmPaymentIntentCapability: ToolCapability = {
   tool: "confirm_payment_intent",
   operation: "confirm",
   readOnly: false,
-  riskScored: false,
-  approvalEligible: false,
+  riskScored: true,
+  approvalEligible: true,
 };
 
 /**
@@ -137,12 +138,19 @@ const confirmPaymentIntentCapability: ToolCapability = {
 export async function confirmPaymentIntent(
   input: ConfirmPaymentIntentInput,
 ): Promise<McpToolResponse<Stripe.PaymentIntent>> {
+  let resolved: { amount: number; currency?: string; customerId?: string };
+  try {
+    resolved = await resolvePaymentIntentValueCents(input.payment_intent_id);
+  } catch (error: unknown) {
+    return toErrorResponse(error);
+  }
+
   return executeStripeOperation(
     {
       capability: confirmPaymentIntentCapability,
-      customerId: undefined,
-      amount: undefined,
-      currency: undefined,
+      customerId: resolved.customerId,
+      amount: resolved.amount,
+      currency: resolved.currency,
       params: input as Record<string, unknown>,
     },
     (options) => {
@@ -169,8 +177,8 @@ const cancelPaymentIntentCapability: ToolCapability = {
   tool: "cancel_payment_intent",
   operation: "cancel",
   readOnly: false,
-  riskScored: false,
-  approvalEligible: false,
+  riskScored: true,
+  approvalEligible: true,
 };
 
 /**
@@ -192,12 +200,19 @@ const cancelPaymentIntentCapability: ToolCapability = {
 export async function cancelPaymentIntent(
   input: CancelPaymentIntentInput,
 ): Promise<McpToolResponse<Stripe.PaymentIntent>> {
+  let resolved: { amount: number; currency?: string; customerId?: string };
+  try {
+    resolved = await resolvePaymentIntentValueCents(input.payment_intent_id);
+  } catch (error: unknown) {
+    return toErrorResponse(error);
+  }
+
   return executeStripeOperation(
     {
       capability: cancelPaymentIntentCapability,
-      customerId: undefined,
-      amount: undefined,
-      currency: undefined,
+      customerId: resolved.customerId,
+      amount: resolved.amount,
+      currency: resolved.currency,
       params: input as Record<string, unknown>,
     },
     (options) => {

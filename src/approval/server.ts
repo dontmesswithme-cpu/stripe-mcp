@@ -13,6 +13,7 @@ import { logger } from "../utils/logger.js";
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 let activeServer: Server | null = null;
+let bindSettled: Promise<boolean> | null = null;
 
 export function bearerMatches(provided: string, expectedHashHex: string): boolean {
   const prefix = "Bearer ";
@@ -24,6 +25,25 @@ export function bearerMatches(provided: string, expectedHashHex: string): boolea
   return timingSafeEqual(a, b);
 }
 
+/**
+ * Resolve once the approval server has either bound its port or failed to.
+ * Resolves true when listening, false when the bind failed / server was
+ * never started. Safe to await multiple times.
+ */
+export function whenApprovalServerReady(): Promise<boolean> {
+  return bindSettled ?? Promise.resolve(false);
+}
+
+/**
+ * Start the approval HTTP server (synchronous, never throws).
+ *
+ * Bind failures (e.g. EADDRINUSE) are async — they surface via the
+ * server's "error" handler, not via a sync return. The sync return is the
+ * server object for lifecycle management; callers that need to know whether
+ * the bind succeeded should check `isApprovalServerActive()` (or wait for
+ * the "listening" event), since `activeServer` is assigned only inside the
+ * "listening" callback and cleared to null on "error".
+ */
 export function startApprovalServer(): Server | null {
   if (config.approvalPort === 0) {
     logger.warn("approval server disabled (APPROVAL_PORT=0)");
@@ -73,7 +93,11 @@ export function startApprovalServer(): Server | null {
     }
 
     if (req.method === "POST" && action === "approve") {
-      const approval = await approveToken(token);
+      const approverHeader = req.headers["x-approver"];
+      const decidedBy =
+        (Array.isArray(approverHeader) ? approverHeader[0] : approverHeader)?.trim() ||
+        "admin";
+      const approval = await approveToken(token, decidedBy);
       if (approval === null) {
         res.writeHead(404);
         res.end(
@@ -90,7 +114,11 @@ export function startApprovalServer(): Server | null {
     }
 
     if (req.method === "POST" && action === "reject") {
-      const approval = await rejectToken(token);
+      const approverHeader = req.headers["x-approver"];
+      const decidedBy =
+        (Array.isArray(approverHeader) ? approverHeader[0] : approverHeader)?.trim() ||
+        "admin";
+      const approval = await rejectToken(token, decidedBy);
       if (approval === null) {
         res.writeHead(404);
         res.end(
@@ -114,15 +142,34 @@ export function startApprovalServer(): Server | null {
     );
   });
 
+  server.on("error", (err) => {
+    logger.error(
+      { err, port: config.approvalPort },
+      "approval server failed to start, approvals disabled",
+    );
+    if (activeServer === server) {
+      activeServer = null;
+    }
+  });
+
+  bindSettled = new Promise<boolean>((resolve) => {
+    server.once("listening", () => resolve(true));
+    server.once("error", () => resolve(false));
+  });
+
   server.listen(config.approvalPort, "127.0.0.1", () => {
+    activeServer = server;
     logger.info(
       { port: config.approvalPort },
       "approval server listening"
     );
   });
 
-  activeServer = server;
   return server;
+}
+
+export function isApprovalServerActive(): boolean {
+  return activeServer !== null;
 }
 
 export function stopApprovalServer(): Promise<void> {
